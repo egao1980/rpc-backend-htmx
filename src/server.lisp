@@ -227,14 +227,25 @@ the event stream (:call-stream) and applies the callee's calling convention."
       (declare (ignore result))
       (list 204 (%hx-header-plist headers) '()))))
 
+;;; A separate, NOTINLINE function on purpose: ECL 26.5.5 miscompiles
+;;; (let ((c (block b (handler-bind ((error (lambda (x) (return-from b x)))) …))))
+;;;   (when c …))
+;;; — after the non-local exit C is bound to the condition, but the WHEN test
+;;; takes the NIL branch, so the error event was never written. Returning the
+;;; condition from its own function avoids it.
+(declaim (notinline %run-capturing-error))
+(defun %run-capturing-error (thunk stream)
+  "Call THUNK on STREAM. → the ERROR it did not handle (unwound), or NIL."
+  (block run
+    (handler-bind ((error (lambda (c) (return-from run c))))
+      (funcall thunk stream)
+      nil)))
+
 (defun %stream-boundary (transport stream thunk)
   "Run THUNK on STREAM. An ERROR it does not handle becomes one
 +STREAM-ERROR-EVENT+ event carrying HTMX-ERROR-RESPONSE's fragment (the second
 contract boundary; the response is already open)."
-  (let ((condition (block run
-                     (handler-bind ((error (lambda (c) (return-from run c))))
-                       (funcall thunk stream)
-                       nil))))
+  (let ((condition (%run-capturing-error thunk stream)))
     (when (and condition (not (rpc-protocol:rpc-stream-closed-p stream)))
       (handler-case
           (rpc-protocol:rpc-send
