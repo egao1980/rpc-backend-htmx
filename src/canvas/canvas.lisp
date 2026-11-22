@@ -24,7 +24,8 @@
 ;;;     (not in a list); unknown → HTMX-ERROR-RESPONSE of an HTMX-ERROR status 404.
 ;;;     Every other request runs the next method with CANVAS:*CANVAS-RESOLVER*
 ;;;     bound to (make-htmx-resolver transport handler) — handler functions,
-;;;     PAGE and the hx helpers resolve through it.
+;;;     PAGE and the hx helpers resolve through it. That includes a :call-stream
+;;;     handler running later inside the streaming response function.
 ;;;   HTMX-RESULT-NODES — the result through CANVAS:RENDER (components, charts,
 ;;;     strings, numbers, nodes, lists), flattened to a fresh list of nodes.
 ;;;   HTMX-FULL-PAGE — (CANVAS:PAGE nodes :title (canvas-transport-page-title tx)),

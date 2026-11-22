@@ -92,3 +92,35 @@
     (ok (equal "#canvas-error" (hdr r "HX-Retarget"))))
   (ok (equal "<p>3</p>" (h:htmx-reply-body (h:htmx-request (canvas-client) (m "COERCE-CANVAS")
                                                          '(:page "3"))))))
+
+;;; Streaming through the canvas transport: the response function runs after
+;;; HTMX-HANDLE-REQUEST (and its :around) returned, yet the handler still
+;;; builds links through CANVAS:*CANVAS-RESOLVER*.
+
+(defun canvas-link-ticker (stream &key)
+  (rpc:rpc-send stream (cons "row" (canvas:el :a (canvas:hx-get (canvas:canvas-link 'people :sort "-name"))
+                                              "sort")))
+  (rpc:rpc-send stream (cons "row" (canvas:el :span nil (canvas:canvas-url 'people :page 2))))
+  (rpc:rpc-send stream (cons "row" (canvas:el :span nil (if (canvas:canvas-url 'not-listed)
+                                                            "listed" "inert")))))
+
+(deftest canvas-stream-builds-links
+  (let* ((tx (canvas-transport))
+         (c (h:make-htmx-client
+             (h:htmx-app tx (h:make-htmx-handlers 'people '(canvas-link-ticker :mode :call-stream)))
+             :codec (h:htmx-transport-codec tx)))
+         (r nil) (escaped nil))
+    (ok (progn (block run
+                 (handler-bind ((error (lambda (e) (setf escaped e) (return-from run))))
+                   (setf r (h:htmx-request c (m "CANVAS-LINK-TICKER") nil
+                                           :accept "text/event-stream"))))
+               (null escaped))
+        "no error escapes")
+    (ok (= 200 (h:htmx-reply-status r)))
+    (ok (equal `(("row" . ,(s+ "<a hx-get=\"" +people-url+ "?sort=-name\">sort</a>"))
+                 ("row" . ,(s+ "<span>" +people-url+ "?page=2</span>"))
+                 ("row" . "<span>inert</span>"))
+               (h:htmx-reply-events r))
+        "the request's resolver (with its allowlist) is bound while the stream runs")
+    (ok (notany (lambda (ev) (equal h:+stream-error-event+ (car ev))) (h:htmx-reply-events r))
+        "no *canvas-resolver* is NIL error event")))

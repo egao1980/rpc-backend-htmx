@@ -31,6 +31,13 @@
 ;;;      HTMX-EVENT-STREAM over the response stream; returning (or RPC-CLOSE)
 ;;;      ends the response. A condition after the stream opened → one event
 ;;;      named +STREAM-ERROR-EVENT+ whose data is the error fragment, then close.
+;;;      The writer runs after HTMX-HANDLE-REQUEST returned (the server calls
+;;;      the streaming function), so it re-establishes the request's dynamic
+;;;      context itself: *HTMX-REQUEST*, the condition boundary (the error
+;;;      fragment is the body of HTMX-ERROR-RESPONSE; nothing escapes the
+;;;      writer), and any specials a transport's :around bound (canvas resolver).
+;;;      The stream is open once the writer starts: a condition before the
+;;;      first event is still 200 + that single error event.
 ;;; 5. A condition before a response started → (HTMX-ERROR-RESPONSE transport c).
 ;;;    Conditions never escape the app (ERROR only; warnings pass through).
 ;;;

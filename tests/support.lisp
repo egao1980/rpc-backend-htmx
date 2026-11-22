@@ -88,6 +88,16 @@
   (h:htmx-stream-keepalive stream)
   (rpc:rpc-send stream (cons "row" "b")))
 
+(defun ticker-fail-first (stream &key)
+  (declare (ignore stream))
+  (error "early <boom>"))
+
+(defun ticker-context (stream &key)
+  "Reads *HTMX-REQUEST* while streaming (the response runs after HTMX-HANDLE-REQUEST returned)."
+  (rpc:rpc-send stream (cons "target" (getf (h:htmx-message-metadata h:*htmx-request*) :target)))
+  (rpc:rpc-send stream (cons "method" (h:htmx-message-method h:*htmx-request*)))
+  (rpc:rpc-send stream (cons "param" (getf (h:htmx-message-params h:*htmx-request*) :n))))
+
 (defun not-listed (&key)
   "fbound but never in the table")
 
@@ -100,6 +110,8 @@
    '(ticker-hostile :mode :call-stream)
    '(ticker-fail :mode :call-stream)
    '(ticker-keepalive :mode :call-stream)
+   '(ticker-fail-first :mode :call-stream)
+   '(ticker-context :mode :call-stream)
    (list "X::LAMBDA" (lambda (&key) "lam"))))
 
 (defun transport (&rest keys)
