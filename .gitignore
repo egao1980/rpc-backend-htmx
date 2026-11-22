@@ -1,0 +1,10 @@
+.qlot/
+*.fasl
+*.dx64fsl
+*~
+.DS_Store
+.cl-repository/
+cl-repo.lock
+.team-solve/
+*.lx64fsl
+*.wx64fsl
