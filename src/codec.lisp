@@ -107,8 +107,15 @@
 
 (defun make-htmx-codec (&key (prefix "/") (max-body-bytes +default-max-body-bytes+))
   "PREFIX a string starting and ending with /; MAX-BODY-BYTES a non-negative integer."
-  (declare (ignore prefix max-body-bytes))
-  (%htmx0-pending 'make-htmx-codec))
+  (check-type prefix (and string (satisfies %slash-bounded-p)))
+  (check-type max-body-bytes (integer 0))
+  (make-instance 'htmx-codec :prefix prefix :max-body-bytes max-body-bytes))
+
+(defun %slash-bounded-p (string)
+  "True for a non-empty string that starts and ends with /."
+  (and (stringp string) (plusp (length string))
+       (char= #\/ (char string 0))
+       (char= #\/ (char string (1- (length string))))))
 
 (defclass htmx-message ()
   ((method :initarg :method :reader htmx-message-method
@@ -123,29 +130,368 @@
                 :documentation ":GET or :POST."))
   (:documentation "One decoded htmx request."))
 
+
+;;; ---------------------------------------------------------------------------
+;;; Small shared helpers
+;;; ---------------------------------------------------------------------------
+
+(deftype %octets () '(simple-array (unsigned-byte 8) (*)))
+
+(defun %empty-octets ()
+  (make-array 0 :element-type '(unsigned-byte 8)))
+
+(defun %octets (sequence)
+  (coerce sequence '%octets))
+
+(defun %prefixp (prefix string)
+  (and (stringp string)
+       (>= (length string) (length prefix))
+       (string= prefix string :end2 (length prefix))))
+
+(defun %env-header (env name)
+  "Request header NAME (lowercase) from a Clack ENV, or NIL."
+  (let ((headers (getf env :headers)))
+    (and (hash-table-p headers) (values (gethash name headers)))))
+
+(defun %utf8-octets (string)
+  (%octets (stack-encoding:encode-to-octets string :encoding :utf-8)))
+
+(defun %utf8-string (octets)
+  "OCTETS as UTF-8 text. Invalid UTF-8 → STACK-ENCODING:ENCODING-ERROR."
+  (stack-encoding:decode-octets octets :encoding :utf-8))
+
+(defun %method-not-found (rest)
+  (error 'rpc-protocol:rpc-method-not-found
+         :message (format nil "Method not found: ~A" rest)))
+
+;;; ---------------------------------------------------------------------------
+;;; The request body: the one place that reads :RAW-BODY
+;;; ---------------------------------------------------------------------------
+
+(defun %read-request-body (env limit)
+  "The request body as octets, at most LIMIT of them.
+The only function that reads :RAW-BODY. http-server-protocol has no body
+helper yet (https://github.com/egao1980/http-server-protocol/issues/12); when
+`request-body-octets :max-bytes` ships, this becomes a call to it.
+A Content-Length above LIMIT signals HTMX-BODY-TOO-LARGE (:size = that length)
+before anything is read. Without one, at most LIMIT+1 octets are read with
+READ-SEQUENCE, and more than LIMIT signals HTMX-BODY-TOO-LARGE (:size NIL)."
+  (let ((length (getf env :content-length))
+        (in (getf env :raw-body)))
+    (when (and length (not (typep length '(integer 0))))
+      (error 'htmx-bad-request :message "Bad Content-Length"))
+    (when (and length (> length limit))
+      (error 'htmx-body-too-large :limit limit :size length))
+    (cond ((or (eql length 0) (and (null in) (null length)))
+           (%empty-octets))
+          ((null in)
+           (error 'htmx-bad-request :message "Missing request body"))
+          (t
+           (let* ((buffer (make-array (or length (1+ limit))
+                                      :element-type '(unsigned-byte 8)))
+                  (n (read-sequence buffer in)))
+             (cond ((and length (< n length))
+                    (error 'htmx-bad-request :message "Truncated request body"))
+                   ((> n limit)
+                    (error 'htmx-body-too-large :limit limit :size nil))
+                   (t (subseq buffer 0 n))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Params: urlencoded (quri), multipart (mime-protocol), UTF-8 (encoding-protocol)
+;;; ---------------------------------------------------------------------------
+
+(defun %latin1-to-utf8 (string)
+  "STRING holds one octet per character (quri decoded it as Latin-1) → UTF-8 text."
+  (%utf8-string (stack-encoding:encode-to-octets string :encoding :latin-1)))
+
+(defun %form-pairs (octets)
+  "application/x-www-form-urlencoded OCTETS → ((name . value) …) in wire order.
+quri splits the fields without decoding; each piece is then percent-decoded
+strictly (octet-transparent, as Latin-1) and read as UTF-8 by encoding-protocol.
+Empty names are dropped; a field without = has the value \"\"."
+  (handler-case
+      (loop for (key . value) in (quri:url-decode-params (%octets octets)
+                                                         :lenient t :percent-decode nil)
+            for name = (%latin1-to-utf8 (quri:url-decode (%octets key) :encoding :latin-1))
+            unless (zerop (length name))
+              collect (cons name
+                            (if value
+                                (%latin1-to-utf8 (quri:url-decode (%octets value)
+                                                                  :encoding :latin-1))
+                                "")))
+    (quri:uri-error ()
+      (error 'htmx-bad-request :message "Malformed urlencoded data"))
+    (stack-encoding:encoding-error ()
+      (error 'htmx-bad-request :message "Invalid UTF-8 in urlencoded data"))))
+
+(defun %multipart-pairs (media-type body)
+  "multipart/form-data BODY (octets) → ((name . value) …) in part order.
+mime-protocol parses the entity; the header block it reads is rebuilt from
+the parsed MEDIA-TYPE, never copied from the request."
+  (handler-case
+      (let* ((head (format nil "Content-Type: ~A~C~C~C~C"
+                           (stack-mime:format-media-type media-type)
+                           #\Return #\Linefeed #\Return #\Linefeed))
+             (entity (stack-mime:parse-mime
+                      (concatenate '%octets
+                                   (stack-encoding:encode-to-octets head :encoding :latin-1)
+                                   body))))
+        (loop for part in (stack-mime:mime-parts entity)
+              for disposition = (stack-mime:mime-content-disposition part)
+              for name = (and disposition (stack-mime:disposition-name disposition))
+              when (stack-mime:multipart-p part)
+                do (error 'htmx-bad-request :message "Nested multipart is not supported")
+              when (and name (plusp (length name)))
+                collect (cons name (%utf8-string (%octets (stack-mime:mime-content part))))))
+    (stack-mime:mime-error ()
+      (error 'htmx-bad-request :message "Malformed multipart body"))
+    (stack-encoding:encoding-error ()
+      (error 'htmx-bad-request :message "Invalid UTF-8 in multipart body"))))
+
+(defun %body-pairs (env body)
+  "Pairs of a non-empty POST BODY, by its content type."
+  (let ((content-type (or (getf env :content-type) (%env-header env "content-type"))))
+    (unless content-type
+      (error 'htmx-unsupported-media-type :content-type nil))
+    (let ((media-type (handler-case (stack-mime:parse-media-type content-type)
+                        (stack-mime:mime-error ()
+                          (error 'htmx-bad-request :message "Malformed Content-Type")))))
+      (let ((essentials (stack-mime:media-type-essentials media-type)))
+        (cond ((string= essentials "application/x-www-form-urlencoded")
+               (let ((charset (stack-mime:media-type-charset media-type)))
+                 (unless (or (null charset) (string-equal charset "utf-8"))
+                   (error 'htmx-unsupported-media-type :content-type content-type)))
+               (%form-pairs body))
+              ((string= essentials "multipart/form-data")
+               (%multipart-pairs media-type body))
+              (t (error 'htmx-unsupported-media-type :content-type content-type)))))))
+
+(defun %params-plist (pairs)
+  "PAIRS in wire order → keyword plist; first-occurrence order, later
+duplicates replace the value in place. Values stay strings."
+  (let ((cells (make-hash-table :test 'eq)) ; lookup only, never iterated
+        (out '()))
+    (loop for (name . value) in pairs
+          for key = (intern (string-upcase name) :keyword)
+          for cell = (gethash key cells)
+          do (if cell
+                 (setf (cdr cell) value)
+                 (let ((new (cons key value)))
+                   (setf (gethash key cells) new)
+                   (push new out))))
+    (loop for (key . value) in (nreverse out) collect key collect value)))
+
+(defun %request-metadata (env)
+  (loop for (header . key) in +request-metadata-headers+
+        for value = (%env-header env header)
+        when value
+          if (member key '(:request :boosted))
+            when (string-equal value "true") collect key and collect t end
+          else collect key and collect value))
+
+(defun %request-mode (env)
+  (let ((accept (%env-header env "accept")))
+    (if (and accept (search "text/event-stream" accept :test #'char-equal))
+        :call-stream
+        :call-response)))
+
 (defmethod rpc-protocol:decode-message-using-codec ((codec htmx-codec) env)
-  (declare (ignore env))
-  (%htmx0-pending 'decode-message-using-codec))
+  (let ((http-method (getf env :request-method)))
+    (unless (member http-method '(:get :post))
+      (error 'htmx-method-not-allowed))
+    (let* ((prefix (htmx-codec-prefix codec))
+           (path (or (getf env :path-info) ""))
+           (rest (if (%prefixp prefix path) (subseq path (length prefix)) nil)))
+      (unless (and rest (%method-name-p rest))
+        (%method-not-found (or rest path)))
+      (let* ((query (getf env :query-string))
+             (pairs (if (and query (plusp (length query)))
+                        (%form-pairs (%utf8-octets query))
+                        '())))
+        (when (eq http-method :post)
+          (let ((body (%read-request-body env (htmx-codec-max-body-bytes codec))))
+            (when (plusp (length body))
+              (setf pairs (append pairs (%body-pairs env body))))))
+        (make-instance 'htmx-message
+                       :method rest
+                       :params (%params-plist pairs)
+                       :metadata (%request-metadata env)
+                       :mode (%request-mode env)
+                       :http-method http-method)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Requests (client side)
+;;; ---------------------------------------------------------------------------
+
+(defun %method-string (method)
+  (etypecase method
+    (string method)
+    (symbol (htmx-method-name method))))
+
+(defun %params-alist (params)
+  "Plist keyword → string / integer (NIL dropped) → ((\"name\" . \"value\") …)."
+  (loop for (key value) on params by #'cddr
+        unless (null value)
+          collect (cons (string-downcase (string key))
+                        (typecase value
+                          (string value)
+                          (integer (format nil "~D" value))
+                          (t (error 'htmx-error
+                                    :message (format nil "Param ~S: not a string or integer: ~S"
+                                                     key value)))))))
+
+(defun %request-uri (prefix method query)
+  (let* ((sep (search "::" method))
+         (encoded (if sep
+                      (concatenate 'string
+                                   (quri:url-encode (subseq method 0 sep))
+                                   "::"
+                                   (quri:url-encode (subseq method (+ sep 2))))
+                      (quri:url-encode method))))
+    (concatenate 'string prefix encoded (if query (concatenate 'string "?" query) ""))))
+
+(defun %encode-env (codec http-method path-info query body content-type metadata headers
+                    &key request-uri)
+  "The one Clack env builder. BODY octets (POST) or NIL."
+  (let ((table (make-hash-table :test 'equal)))
+    (loop for (header . key) in +request-metadata-headers+
+          for value = (getf metadata key)
+          when value
+            do (setf (gethash header table) (if (eq value t) "true" value)))
+    (loop for (name . value) in headers
+          do (setf (gethash (string-downcase name) table) value))
+    (when body
+      (setf (gethash "content-type" table) content-type
+            (gethash "content-length" table) (format nil "~D" (length body))))
+    (append (list :request-method http-method
+                  :script-name ""
+                  :path-info path-info
+                  :request-uri (or request-uri
+                                   (%request-uri (htmx-codec-prefix codec)
+                                                 (subseq path-info (length (htmx-codec-prefix codec)))
+                                                 query))
+                  :query-string query
+                  :server-name "localhost"
+                  :server-port 80
+                  :server-protocol :http/1.1
+                  :url-scheme "http"
+                  :remote-addr "127.0.0.1"
+                  :headers table)
+            (when body
+              (list :content-type content-type
+                    :content-length (length body)
+                    :raw-body (http-protocol:make-octet-input-stream body))))))
+
+(defun %multipart-octets (alist)
+  "ALIST as a multipart/form-data body → (values octets content-type)."
+  (multiple-value-bind (stream content-type length) (http-protocol:make-multipart-body alist nil)
+    (unless length
+      (error 'htmx-error :message "multipart body without a length"))
+    (let* ((buffer (make-array length :element-type '(unsigned-byte 8)))
+           (n (read-sequence buffer stream)))
+      (values (subseq buffer 0 n) content-type))))
 
 (defmethod rpc-protocol:encode-request-using-codec
     ((codec htmx-codec) method params &key id (http-method :get) (encoding :urlencoded)
                                         metadata headers)
-  (declare (ignore method params id http-method encoding metadata headers))
-  (%htmx0-pending 'encode-request-using-codec))
+  (declare (ignore id))
+  (let* ((name (%method-string method))
+         (alist (%params-alist params))
+         (form (and alist (%octets (http-protocol:encode-urlencoded alist))))
+         (path-info (concatenate 'string (htmx-codec-prefix codec) name)))
+    (ecase http-method
+      (:get
+       (unless (eq encoding :urlencoded)
+         (error 'htmx-error :message (format nil "~S encoding needs :post" encoding)))
+       (%encode-env codec :get path-info (and form (%utf8-string form)) nil nil
+                    metadata headers))
+      (:post
+       (ecase encoding
+         (:urlencoded
+          (%encode-env codec :post path-info nil (or form (%empty-octets))
+                       "application/x-www-form-urlencoded" metadata headers))
+         (:multipart
+          (multiple-value-bind (body content-type) (%multipart-octets alist)
+            (%encode-env codec :post path-info nil body content-type metadata headers))))))))
 
 (defmethod rpc-protocol:encode-notification-using-codec
     ((codec htmx-codec) method params &key (encoding :urlencoded) metadata headers)
-  (declare (ignore method params encoding metadata headers))
-  (%htmx0-pending 'encode-notification-using-codec))
+  (rpc-protocol:encode-request-using-codec codec method params
+                                           :http-method :post :encoding encoding
+                                           :metadata metadata :headers headers))
+
+;;; ---------------------------------------------------------------------------
+;;; Responses
+;;; ---------------------------------------------------------------------------
+
+(defun %plain-nodes (result)
+  "RESULT → fresh list of html-protocol nodes (the default HTMX-RESULT-NODES)."
+  (typecase result
+    (null '())
+    (stack-html:html-node (list result))
+    (string (list (make-instance 'stack-html:html-text :data result)))
+    (list (loop for item in result append (%plain-nodes item)))
+    (t (error 'htmx-error
+              :message (format nil "Cannot turn ~S into HTML nodes" (type-of result))))))
+
+(defun %html-string (result)
+  "Serialized HTML for RESULT: an html-document whole, else its nodes."
+  (stack-html:serialize
+   (if (typep result 'stack-html:html-document)
+       result
+       (stack-html:make-html-document :children (%plain-nodes result)))))
+
+(defun %header-name-char-p (char)
+  (or (char<= #\a char #\z) (char<= #\A char #\Z) (char<= #\0 char #\9) (char= char #\-)))
+
+(defun %hx-header-plist (headers)
+  "Response metadata alist ((\"HX-…\" . string) …) → Clack header plist, in order.
+Anything else → HTMX-ERROR (500)."
+  (loop for entry in headers
+        for (name . value) = (if (consp entry) entry (cons nil nil))
+        unless (and (stringp name)
+                    (> (length name) 3)
+                    (string-equal "HX-" name :end2 3)
+                    (every #'%header-name-char-p name)
+                    (stringp value)
+                    (not (find #\Return value))
+                    (not (find #\Linefeed value)))
+          do (error 'htmx-error :status 500
+                                :message (format nil "Refused response header ~S" name))
+        collect (intern (string-upcase name) :keyword)
+        collect value))
 
 (defmethod rpc-protocol:encode-response-using-codec
     ((codec htmx-codec) result &key id (status 200) headers)
-  (declare (ignore result id status headers))
-  (%htmx0-pending 'encode-response-using-codec))
+  (declare (ignore id))
+  (let ((header-plist (%hx-header-plist headers)))
+    (list status
+          (list* :content-type "text/html; charset=utf-8" header-plist)
+          (list (%html-string result)))))
+
+(defun %error-status (code)
+  (cond ((and (integerp code) (<= 100 code 599)) code)
+        ((eql code rpc-protocol:+method-not-found+) 404)
+        ((eql code rpc-protocol:+invalid-params+) 422)
+        ((member code (list rpc-protocol:+invalid-request+ rpc-protocol:+parse-error+)) 400)
+        (t 500)))
+
+(defun %error-fragment (message)
+  "<p role=\"alert\">MESSAGE</p>, MESSAGE one escaped text node."
+  (stack-html:serialize
+   (stack-html:make-html-document
+    :children (list (stack-html:make-html-element
+                     "p" :attributes (list (cons "role" "alert"))
+                         :children (list (make-instance 'stack-html:html-text
+                                                        :data message)))))))
 
 (defmethod rpc-protocol:encode-error-response-using-codec
     ((codec htmx-codec) code message &key id data
                                       (target +error-fragment-target+)
                                       (swap +error-fragment-swap+))
-  (declare (ignore code message id data target swap))
-  (%htmx0-pending 'encode-error-response-using-codec))
+  (declare (ignore id data))
+  (list (%error-status code)
+        (list :content-type "text/html; charset=utf-8"
+              :hx-retarget target
+              :hx-reswap swap)
+        (list (%error-fragment (if (stringp message) message (princ-to-string (or message "")))))))

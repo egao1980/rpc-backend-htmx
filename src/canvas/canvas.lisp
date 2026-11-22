@@ -44,8 +44,15 @@
                                      (max-body-bytes rpc-backend-htmx:+default-max-body-bytes+)
                                      (error-target rpc-backend-htmx:+error-fragment-target+)
                                      (error-swap rpc-backend-htmx:+error-fragment-swap+))
-  (declare (ignore prefix asset-prefix page-title max-body-bytes error-target error-swap))
-  (rpc-backend-htmx::%htmx0-pending 'make-canvas-htmx-transport))
+  (check-type asset-prefix (and string (satisfies rpc-backend-htmx::%slash-bounded-p)))
+  (check-type page-title string)
+  (make-instance 'canvas-htmx-transport
+                 :codec (rpc-backend-htmx:make-htmx-codec :prefix prefix
+                                                          :max-body-bytes max-body-bytes)
+                 :asset-prefix asset-prefix
+                 :page-title page-title
+                 :error-target error-target
+                 :error-swap error-swap))
 
 (defclass htmx-resolver (canvas:path-resolver)
   ((handlers :initarg :handlers :initform nil :reader htmx-resolver-handlers
@@ -55,30 +62,74 @@
 (defun make-htmx-resolver (transport &optional handlers)
   "Resolver for TRANSPORT's prefix (and asset prefix when it is a CANVAS-HTMX-TRANSPORT;
 else the canvas-protocol default) limited to HANDLERS."
-  (declare (ignore transport handlers))
-  (rpc-backend-htmx::%htmx0-pending 'make-htmx-resolver))
+  (check-type transport rpc-backend-htmx:htmx-transport)
+  (make-instance 'htmx-resolver
+                 :prefix (rpc-backend-htmx:htmx-transport-prefix transport)
+                 :asset-prefix (if (typep transport 'canvas-htmx-transport)
+                                   (canvas-transport-asset-prefix transport)
+                                   (canvas:path-resolver-asset-prefix
+                                    (canvas:make-path-resolver)))
+                 :handlers handlers))
+
+(defun %known-asset-p (name)
+  (and (stringp name) (member name (canvas:asset-names) :test #'string=) t))
 
 (defmethod canvas:resolve-canvas-url ((resolver htmx-resolver) symbol params)
-  (declare (ignore symbol params))
-  (rpc-backend-htmx::%htmx0-pending 'resolve-canvas-url))
+  (let ((handlers (htmx-resolver-handlers resolver)))
+    (if (and (typep handlers 'rpc-backend-htmx:htmx-handlers)
+             (not (and (rpc-backend-htmx::%method-symbol-p symbol)
+                       (rpc-backend-htmx:find-htmx-handler
+                        handlers (rpc-backend-htmx:htmx-method-name symbol)))))
+        nil
+        (call-next-method))))
 
 (defmethod canvas:resolve-asset-url ((resolver htmx-resolver) name)
-  (declare (ignore name))
-  (rpc-backend-htmx::%htmx0-pending 'resolve-asset-url))
+  (if (%known-asset-p name)
+      (call-next-method)
+      nil))
+
+(defun %asset-response (transport name)
+  (if (%known-asset-p name)
+      (list 200
+            (list :content-type (canvas:asset-content-type name))
+            (canvas:asset-bytes name))
+      (rpc-backend-htmx:htmx-error-response
+       transport
+       (make-condition 'rpc-backend-htmx:htmx-error :status 404 :message "Asset not found"))))
 
 (defmethod rpc-backend-htmx:htmx-handle-request :around
     ((transport canvas-htmx-transport) handler stream-handler env)
-  (declare (ignore handler stream-handler env))
-  (rpc-backend-htmx::%htmx0-pending 'htmx-handle-request/canvas))
+  (declare (ignore stream-handler))
+  (rpc-backend-htmx::%with-error-response (transport)
+    (let ((path (getf env :path-info))
+          (asset-prefix (canvas-transport-asset-prefix transport)))
+      (if (and (eq (getf env :request-method) :get)
+               (rpc-backend-htmx::%prefixp asset-prefix path))
+          (%asset-response transport (subseq path (length asset-prefix)))
+          (let* ((resolver (make-htmx-resolver transport handler))
+                 (response (let ((canvas:*canvas-resolver* resolver))
+                             (call-next-method))))
+            (if (functionp response)
+                ;; A Clack streaming response runs after this method returned:
+                ;; re-bind the resolver around it.
+                (lambda (responder)
+                  (let ((canvas:*canvas-resolver* resolver))
+                    (funcall response responder)))
+                response))))))
 
 (defmethod rpc-backend-htmx:htmx-result-nodes ((transport canvas-htmx-transport) result)
-  (declare (ignore result))
-  (rpc-backend-htmx::%htmx0-pending 'htmx-result-nodes/canvas))
+  (labels ((flatten (rendered)
+             (typecase rendered
+               (null '())
+               (list (loop for item in rendered append (flatten item)))
+               (t (list rendered)))))
+    (flatten (canvas:render result))))
 
 (defmethod rpc-backend-htmx:htmx-full-page ((transport canvas-htmx-transport) nodes message)
-  (declare (ignore nodes message))
-  (rpc-backend-htmx::%htmx0-pending 'htmx-full-page/canvas))
+  (declare (ignore message))
+  (canvas:page nodes :title (canvas-transport-page-title transport)))
 
 (defmethod rpc-backend-htmx:htmx-condition-status ((transport canvas-htmx-transport) condition)
-  (declare (ignore condition))
-  (rpc-backend-htmx::%htmx0-pending 'htmx-condition-status/canvas))
+  (if (typep condition 'canvas:canvas-coercion-error)
+      422
+      (call-next-method)))

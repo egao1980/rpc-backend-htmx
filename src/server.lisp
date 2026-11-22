@@ -103,13 +103,14 @@
 (defun make-htmx-transport (&key (prefix "/") (max-body-bytes +default-max-body-bytes+)
                               (error-target +error-fragment-target+)
                               (error-swap +error-fragment-swap+))
-  (declare (ignore prefix max-body-bytes error-target error-swap))
-  (%htmx0-pending 'make-htmx-transport))
+  (make-instance 'htmx-transport
+                 :codec (make-htmx-codec :prefix prefix :max-body-bytes max-body-bytes)
+                 :error-target error-target
+                 :error-swap error-swap))
 
 (defun htmx-transport-prefix (transport)
   "The codec prefix."
-  (declare (ignore transport))
-  (%htmx0-pending 'htmx-transport-prefix))
+  (htmx-codec-prefix (htmx-transport-codec transport)))
 
 (defgeneric htmx-handle-request (transport handler stream-handler env)
   (:documentation "Clack response for ENV. See the file header."))
@@ -128,16 +129,149 @@
 
 (defun htmx-app (transport handler &key stream-handler)
   "Clack app serving HANDLER / STREAM-HANDLER through TRANSPORT."
-  (declare (ignore transport handler stream-handler))
-  (%htmx0-pending 'htmx-app))
+  (check-type transport htmx-transport)
+  (check-type handler (or htmx-handlers function null))
+  (check-type stream-handler (or function null))
+  (lambda (env)
+    (htmx-handle-request transport handler stream-handler env)))
+
+;;; ---------------------------------------------------------------------------
+;;; Condition boundaries
+;;;
+;;; The app's contract is that no ERROR escapes it. That overrides the usual
+;;; "no catch-all ERROR in library code" rule at exactly two sites: the request
+;;; boundary (%WITH-ERROR-RESPONSE) and the stream boundary (%STREAM-BOUNDARY,
+;;; inside the streaming writer, which runs after HTMX-HANDLE-REQUEST returned).
+;;; Inner handlers win: a handler's own HANDLER-BIND / restarts (canvas
+;;; COERCE-FORM's USE-VALUE) and the codec's translations run first. Warnings
+;;; pass through.
+;;; ---------------------------------------------------------------------------
+
+(defparameter +fallback-error-fragment+ (%error-fragment "Internal server error")
+  "Serialized once at load time, so the fallback cannot fail.")
+
+(defun %fallback-error-response (transport)
+  "500 response built without calling any extension method: the last resort when
+HTMX-ERROR-RESPONSE itself fails."
+  (list 500
+        (list :content-type "text/html; charset=utf-8"
+              :hx-retarget (htmx-transport-error-target transport)
+              :hx-reswap (htmx-transport-error-swap transport))
+        (list +fallback-error-fragment+)))
+
+(defun %safe-error-response (transport condition)
+  "(HTMX-ERROR-RESPONSE transport condition), or the fallback 500 when that signals.
+Called from inside a HANDLER-BIND handler, where only outer handlers are active
+(CLHS 9.1.4.1), so the error response needs its own guard."
+  (handler-case (htmx-error-response transport condition)
+    (error () (%fallback-error-response transport))))
+
+(defmacro %with-error-response ((transport) &body body)
+  "Run BODY; an ERROR not handled inside it becomes (HTMX-ERROR-RESPONSE transport c).
+HANDLER-BIND, so the error response is built in the signaller's dynamic
+environment (*HTMX-REQUEST*, a transport's specials), then unwinds."
+  (let ((boundary (gensym "BOUNDARY")) (tx (gensym "TRANSPORT")))
+    `(let ((,tx ,transport))
+       (block ,boundary
+         (handler-bind ((error (lambda (c)
+                                 (return-from ,boundary (%safe-error-response ,tx c)))))
+           ,@body)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Request flow
+;;; ---------------------------------------------------------------------------
+
+(defun %resolve-callee (handler stream-handler message)
+  "→ (values thunk mode). THUNK takes no argument (:call-response, :notify) or
+the event stream (:call-stream) and applies the callee's calling convention."
+  (let ((name (htmx-message-method message))
+        (params (htmx-message-params message))
+        (streamp (eq (htmx-message-mode message) :call-stream)))
+    (etypecase handler
+      (htmx-handlers
+       (multiple-value-bind (fn mode) (find-htmx-handler handler name)
+         (cond ((null fn) (%method-not-found name))
+               ((and (eq mode :call-stream) (not streamp))
+                (error 'htmx-not-acceptable))
+               ((eq mode :call-stream)
+                (values (lambda (stream) (apply fn stream :allow-other-keys t params))
+                        mode))
+               (t
+                (values (lambda () (apply fn :allow-other-keys t params)) mode)))))
+      ((or function null)
+       (let ((fn (if streamp stream-handler handler)))
+         (unless fn (%method-not-found name))
+         (if streamp
+             (values (lambda (stream) (funcall fn :call-stream name params stream))
+                     :call-stream)
+             (values (lambda () (funcall fn name params)) :call-response)))))))
+
+(defun %plain-get-p (message)
+  "A GET without HX-Request: the browser wants a page."
+  (and (eq (htmx-message-http-method message) :get)
+       (not (getf (htmx-message-metadata message) :request))))
+
+(defun %respond-call (transport thunk message)
+  (let ((*htmx-request* message))
+    (multiple-value-bind (result headers) (funcall thunk)
+      (let ((nodes (htmx-result-nodes transport result)))
+        (rpc-protocol:encode-response-using-codec
+         (htmx-transport-codec transport)
+         (if (%plain-get-p message) (htmx-full-page transport nodes message) nodes)
+         :headers headers)))))
+
+(defun %respond-notify (transport thunk message)
+  (declare (ignore transport))
+  (let ((*htmx-request* message))
+    (multiple-value-bind (result headers) (funcall thunk)
+      (declare (ignore result))
+      (list 204 (%hx-header-plist headers) '()))))
+
+(defun %stream-boundary (transport stream thunk)
+  "Run THUNK on STREAM. An ERROR it does not handle becomes one
++STREAM-ERROR-EVENT+ event carrying HTMX-ERROR-RESPONSE's fragment (the second
+contract boundary; the response is already open)."
+  (let ((condition (block run
+                     (handler-bind ((error (lambda (c) (return-from run c))))
+                       (funcall thunk stream)
+                       nil))))
+    (when (and condition (not (rpc-protocol:rpc-stream-closed-p stream)))
+      (handler-case
+          (rpc-protocol:rpc-send
+           stream
+           (stack-sse:make-sse-event
+            :event +stream-error-event+
+            :data (format nil "~{~A~}" (third (%safe-error-response transport condition)))))
+        ;; The peer may be gone: nothing escapes the writer.
+        (error () nil)))))
+
+(defun %respond-stream (transport thunk message env)
+  "text/event-stream response through sse-backend-clack. The writer runs later,
+under the server (or CALL-SSE-APP), so it re-binds *HTMX-REQUEST* and has its
+own condition boundary."
+  (funcall (sse-backend-clack:make-sse-stream-app
+            (lambda (env)
+              (declare (ignore env))
+              (lambda (out)
+                (let* ((*htmx-request* message)
+                       (stream (make-htmx-event-stream out :method (htmx-message-method message)
+                                                           :transport transport)))
+                  (%stream-boundary transport stream thunk)
+                  (rpc-protocol:rpc-close stream)))))
+           env))
 
 (defmethod htmx-handle-request ((transport htmx-transport) handler stream-handler env)
-  (declare (ignore handler stream-handler env))
-  (%htmx0-pending 'htmx-handle-request))
+  (%with-error-response (transport)
+    (let ((message (rpc-protocol:decode-message-using-codec
+                    (htmx-transport-codec transport) env)))
+      (multiple-value-bind (thunk mode) (%resolve-callee handler stream-handler message)
+        (ecase mode
+          (:call-response (%respond-call transport thunk message))
+          (:notify (%respond-notify transport thunk message))
+          (:call-stream (%respond-stream transport thunk message env)))))))
 
 (defmethod htmx-result-nodes ((transport t) result)
-  (declare (ignore result))
-  (%htmx0-pending 'htmx-result-nodes))
+  (%plain-nodes result))
 
 (defmethod htmx-full-page ((transport htmx-transport) nodes message)
   (declare (ignore message))
@@ -145,11 +279,34 @@
 
 (defmethod htmx-condition-status ((transport htmx-transport) condition)
   (declare (ignore condition))
-  (%htmx0-pending 'htmx-condition-status))
+  500)
+
+(defmethod htmx-condition-status ((transport htmx-transport) (condition htmx-error))
+  (htmx-error-status condition))
+
+(defmethod htmx-condition-status ((transport htmx-transport)
+                                  (condition rpc-protocol:rpc-method-not-found))
+  404)
+
+(defmethod htmx-condition-status ((transport htmx-transport)
+                                  (condition rpc-protocol:rpc-invalid-params))
+  422)
 
 (defmethod htmx-error-response ((transport htmx-transport) condition)
-  (declare (ignore condition))
-  (%htmx0-pending 'htmx-error-response))
+  (rpc-protocol:encode-error-response-using-codec
+   (htmx-transport-codec transport)
+   (htmx-condition-status transport condition)
+   (princ-to-string condition)
+   :target (htmx-transport-error-target transport)
+   :swap (htmx-transport-error-swap transport)))
+
+(defmethod htmx-error-response ((transport htmx-transport) (condition htmx-method-not-allowed))
+  (destructuring-bind (status headers body) (call-next-method)
+    (list status (append headers (list :allow "GET, POST")) body)))
+
+;;; ---------------------------------------------------------------------------
+;;; Event stream
+;;; ---------------------------------------------------------------------------
 
 (defclass htmx-event-stream (rpc-protocol:rpc-stream)
   ((output :initarg :output :reader htmx-event-stream-output
@@ -161,32 +318,123 @@
 
 (defun make-htmx-event-stream (output &key method transport)
   "An HTMX-EVENT-STREAM writing to the character stream OUTPUT."
-  (declare (ignore output method transport))
-  (%htmx0-pending 'make-htmx-event-stream))
+  (make-instance 'htmx-event-stream :output output :owner transport
+                                    :transport transport :method method))
+
+(defun %event-name-char-p (char)
+  (or (char<= #\a char #\z) (char<= #\A char #\Z) (char<= #\0 char #\9)
+      (member char '(#\_ #\. #\: #\-))))
+
+(defun %event-name (name)
+  "NAME when it matches [A-Za-z0-9_.:-]+, else HTMX-ERROR."
+  (unless (and (stringp name) (plusp (length name)) (every #'%event-name-char-p name))
+    (error 'htmx-error :message (format nil "Refused SSE event name ~S" name)))
+  name)
+
+(defun %lf (string)
+  "CR LF and lone CR → LF, so data cannot end an SSE line early
+(sse-protocol's encoder splits on LF only: sse-protocol#10)."
+  (if (not (find #\Return string))
+      string
+      (with-output-to-string (out)
+        (loop with n = (length string)
+              for i from 0 below n
+              for char = (char string i)
+              do (cond ((char/= char #\Return) (write-char char out))
+                       (t (write-char #\Linefeed out)
+                          (when (and (< (1+ i) n) (char= (char string (1+ i)) #\Linefeed))
+                            (incf i))))))))
+
+(defun %no-newline (value)
+  (when (and value (find-if (lambda (c) (member c '(#\Return #\Linefeed))) (princ-to-string value)))
+    (error 'htmx-error :message (format nil "Refused SSE field ~S" value)))
+  value)
 
 (defmethod rpc-protocol:backend-rpc-send ((stream htmx-event-stream) message &key)
-  (declare (ignore message))
-  (%htmx0-pending 'backend-rpc-send))
+  (let ((event
+          (etypecase message
+            (stack-sse:sse-event
+             ;; A copy: the caller's event is never mutated.
+             (let ((type (stack-sse:sse-event-type message))
+                   (comment (stack-sse:sse-event-comment message)))
+               (stack-sse:make-sse-event
+                :event (and type (%event-name type))
+                :data (%lf (or (stack-sse:sse-event-data message) ""))
+                :id (%no-newline (stack-sse:sse-event-id message))
+                :retry (%no-newline (stack-sse:sse-event-retry message))
+                :comment (and comment (%lf comment)))))
+            (cons
+             (stack-sse:make-sse-event
+              :event (%event-name (car message))
+              :data (%lf (%html-string
+                          (htmx-result-nodes (htmx-event-stream-owner stream)
+                                             (cdr message)))))))))
+    (stack-sse:write-sse-event (htmx-event-stream-output stream) event :flush t)
+    message))
 
 (defun htmx-stream-keepalive (stream)
   "Write one sse-protocol keepalive on STREAM and flush."
-  (declare (ignore stream))
-  (%htmx0-pending 'htmx-stream-keepalive))
+  (stack-sse:write-sse-keepalive (htmx-event-stream-output stream) :style :comment :flush t)
+  stream)
+
+;;; ---------------------------------------------------------------------------
+;;; Serve, JSON-RPC parity
+;;; ---------------------------------------------------------------------------
 
 (defmethod rpc-protocol:backend-rpc-serve
     ((transport htmx-transport) handler &key (host "127.0.0.1") (port 8080)
                                           (backend http-server-protocol:*http-server-backend*)
                                           stream-handler)
-  (declare (ignore handler host port backend stream-handler))
-  (%htmx0-pending 'backend-rpc-serve))
+  (http-server-protocol:serve (htmx-app transport handler :stream-handler stream-handler)
+                              :host host :port port :backend backend))
 
 (defmethod rpc-protocol:backend-rpc-serve-stream
     ((transport htmx-transport) handler &key (host "127.0.0.1") (port 8080)
                                           (backend http-server-protocol:*http-server-backend*))
-  (declare (ignore handler host port backend))
-  (%htmx0-pending 'backend-rpc-serve-stream))
+  (http-server-protocol:serve (htmx-app transport nil :stream-handler handler)
+                              :host host :port port :backend backend))
+
+(defun %json-param-value (key value)
+  (typecase value
+    (string value)
+    (integer (format nil "~D" value))
+    (t (error 'rpc-protocol:rpc-invalid-params
+              :message (format nil "Param ~A must be a string or an integer" key)))))
+
+(defun %json-params-plist (params)
+  "JSON-RPC PARAMS (NIL, an empty vector or an object) → keyword plist, keys sorted."
+  (cond ((null params) '())
+        ((and (vectorp params) (not (stringp params)) (zerop (length params))) '())
+        ((hash-table-p params)
+         (let ((keys '()))
+           (maphash (lambda (k v) (declare (ignore v)) (push k keys)) params)
+           (unless (every #'stringp keys)
+             (error 'rpc-protocol:rpc-invalid-params :message "Param names must be strings"))
+           ;; Sorted: hash-table order never reaches the handler.
+           (loop for key in (sort keys #'string<)
+                 unless (zerop (length key))
+                   collect (intern (string-upcase key) :keyword)
+                   and collect (%json-param-value key (gethash key params)))))
+        (t (error 'rpc-protocol:rpc-invalid-params
+                  :message "Params must be an object of strings or integers"))))
 
 (defun jsonrpc-handler (transport handlers)
   "JSON-RPC handler over the same HANDLERS table. See the file header."
-  (declare (ignore transport handlers))
-  (%htmx0-pending 'jsonrpc-handler))
+  (check-type transport htmx-transport)
+  (check-type handlers htmx-handlers)
+  (lambda (method params)
+    (let ((plist (%json-params-plist params)))
+      (multiple-value-bind (fn mode) (find-htmx-handler handlers method)
+        (when (or (null fn) (eq mode :call-stream))
+          (%method-not-found method))
+        (let ((*htmx-request* (make-instance 'htmx-message :method method :params plist
+                                                           :mode :call-response
+                                                           :http-method :post)))
+          (multiple-value-bind (result headers) (apply fn :allow-other-keys t plist)
+            (if (eq mode :notify)
+                ""
+                (format nil "~{~A~}"
+                        (third (rpc-protocol:encode-response-using-codec
+                                (htmx-transport-codec transport)
+                                (htmx-result-nodes transport result)
+                                :headers headers))))))))))
