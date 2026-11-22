@@ -24,7 +24,7 @@
     (rpc:rpc-send s (cons "multi" (elt* "p" nil (format nil "a~%b"))))
     (ok (equal (format nil "event: multi~%data: <p>a~%data: b</p>~%~%")
                (get-output-stream-string out)))
-    (rpc:rpc-send s (sse:make-sse-event :type "x.y:z-1" :data "d"))
+    (rpc:rpc-send s (sse:make-sse-event :event "x.y:z-1" :data "d"))
     (ok (equal (format nil "event: x.y:z-1~%data: d~%~%") (get-output-stream-string out))
         "an sse-event (canvas fragment-event) passes through")))
 
@@ -33,7 +33,7 @@
     (ok (signals (rpc:rpc-send s (cons (format nil "a~%event: b") "x")) 'h:htmx-error))
     (ok (signals (rpc:rpc-send s (cons "a b" "x")) 'h:htmx-error))
     (ok (signals (rpc:rpc-send s (cons "" "x")) 'h:htmx-error))
-    (ok (signals (rpc:rpc-send s (sse:make-sse-event :type (format nil "a~Cb" #\Return) :data "x"))
+    (ok (signals (rpc:rpc-send s (sse:make-sse-event :event (format nil "a~Cb" #\Return) :data "x"))
                  'h:htmx-error))
     (rpc:rpc-close s)
     (ok (signals (rpc:rpc-send s (cons "row" "x")) 'rpc:rpc-error) "closed")))
