@@ -303,9 +303,13 @@ Empty names are dropped; a field without = has the value \"\"."
 (defun %file-part-pairs (name part)
   "The pairs a file PART (its disposition has a filename parameter) named NAME
 contributes: () for an empty file input (filename \"\"), else ((NAME . PART)),
-PART itself. See the file header (Multipart parts)."
-  (declare (ignore name part))
-  (%htmx2-pending 'file-part-pairs))
+PART itself. See the file header (Multipart parts).
+Runs inside %MULTIPART-PAIRS' handler, so an unreadable filename* is 400."
+  (let ((filename (stack-mime:disposition-filename
+                   (stack-mime:mime-content-disposition part))))
+    (if (zerop (length filename))
+        '()
+        (list (cons name part)))))
 
 (defun %multipart-pairs (media-type body)
   "multipart/form-data BODY (octets) → ((name . value) …) in part order: VALUE
@@ -357,8 +361,24 @@ the parsed MEDIA-TYPE, never copied from the request."
   "%PARAMS-PLIST for PAIRS that hold file parts: keys in first-occurrence
 order; text values as in 0.1; a name with file parts takes only those (one →
 the entity, several → a fresh list in part order). See the file header."
-  (declare (ignore pairs))
-  (%htmx2-pending 'file-params-plist))
+  (let ((cells (make-hash-table :test 'eq)) ; lookup only, never iterated
+        (out '()))
+    ;; A cell is (KEY TEXT FILES): TEXT the last text value (a string) or NIL,
+    ;; FILES the entities under KEY, newest first.
+    (loop for (name . value) in pairs
+          do (let* ((key (intern (string-upcase name) :keyword))
+                    (cell (or (gethash key cells)
+                              (let ((new (list key nil '())))
+                                (push new out)
+                                (setf (gethash key cells) new)))))
+               (if (stack-mime:mime-entity-p value)
+                   (push value (third cell))
+                   (setf (second cell) value))))
+    (loop for (key text files) in (nreverse out)
+          collect key
+          collect (cond ((null files) text)
+                        ((null (rest files)) (first files))
+                        (t (reverse files))))))
 
 (defun %params-plist (pairs)
   "PAIRS in wire order → keyword plist; first-occurrence order, later
@@ -479,9 +499,10 @@ duplicates replace the value in place. Values stay strings.
                     :content-length (length body)
                     :raw-body (http-protocol:make-octet-input-stream body))))))
 
-(defun %multipart-octets (alist)
-  "ALIST as a multipart/form-data body → (values octets content-type)."
-  (multiple-value-bind (stream content-type length) (http-protocol:make-multipart-body alist nil)
+(defun %multipart-octets (alist &optional files)
+  "ALIST (text fields) and FILES (http-protocol :files entries) as a
+multipart/form-data body, fields first → (values octets content-type)."
+  (multiple-value-bind (stream content-type length) (http-protocol:make-multipart-body alist files)
     (unless length
       (error 'htmx-error :message "multipart body without a length"))
     (let* ((buffer (make-array length :element-type '(unsigned-byte 8)))
@@ -493,13 +514,121 @@ duplicates replace the value in place. Values stay strings.
 a list the file rules refuse. Those requests go to %ENCODE-FILE-REQUEST."
   (loop for (nil value) on params by #'cddr thereis (consp value)))
 
+(defun %file-refused (key control &rest args)
+  "A file value under KEY the File values rules refuse → HTMX-ERROR (500).
+The message never prints the content (it may be large)."
+  (error 'htmx-error
+         :message (format nil "File param ~S: ~?" key control args)))
+
+(defun %proper-list-p (object)
+  "True for a proper list (the repo idiom; circular input is not guarded)."
+  (and (listp object) (null (cdr (last object)))))
+
+(defun %file-value-p (value)
+  "True when VALUE has the shape of one file value: a cons whose car is a keyword."
+  (and (consp value) (keywordp (car value))))
+
+(defun %file-control-char-p (char)
+  (let ((code (char-code char)))
+    (or (< code 32) (= code 127))))
+
+(defun %file-content-type (key type)
+  "T of a file value under KEY → TYPE itself (sent as given), or HTMX-ERROR."
+  (unless (stringp type)
+    (%file-refused key ":content-type must be a string, not a ~(~A~)" (type-of type)))
+  (when (find-if #'%file-control-char-p type)
+    (%file-refused key ":content-type contains a control character"))
+  (let ((media-type (handler-case (stack-mime:parse-media-type type)
+                      (stack-mime:mime-error () nil)))) ; translated just below
+    (unless media-type
+      (%file-refused key ":content-type ~S is not a media type" type))
+    (when (string= "multipart" (stack-mime:media-type-type media-type))
+      (%file-refused key ":content-type cannot be multipart: ~S" type))
+    type))
+
+(defun %file-content (key content)
+  "C of a file value under KEY → a simple octet vector, or HTMX-ERROR."
+  (typecase content
+    (null (%empty-octets))
+    (string (%utf8-octets content))
+    ((vector (unsigned-byte 8)) (%octets content))
+    (t (%file-refused key ":content must be octets, a string or NIL, not a ~(~A~)"
+                      (type-of content)))))
+
+(defun %file-part (key value)
+  "One file VALUE under KEY → an HTTP-PROTOCOL:MAKE-MULTIPART-BODY :files entry
+(\"name\" :filename F :content octets :content-type T), or HTMX-ERROR.
+See the file header (File values)."
+  (unless (%proper-list-p value)
+    (%file-refused key "improper file plist"))
+  (unless (evenp (length value))
+    (%file-refused key "odd file plist"))
+  (let ((seen '())
+        (filename nil)
+        (content (%empty-octets))
+        (content-type "application/octet-stream"))
+    (loop for (k v) on value by #'cddr
+          do (unless (member k '(:filename :content :content-type))
+               (%file-refused key "unknown key ~S (one of :filename :content :content-type)" k))
+             (when (member k seen)
+               (%file-refused key "repeated key ~S" k))
+             (push k seen)
+             (ecase k
+               (:filename
+                (unless (stringp v)
+                  (%file-refused key ":filename must be a string, not a ~(~A~)" (type-of v)))
+                (setf filename v))
+               (:content (setf content (%file-content key v)))
+               (:content-type (setf content-type (%file-content-type key v)))))
+    (unless filename
+      (%file-refused key ":filename is missing"))
+    ;; :content is never NIL (http-protocol needs it); :filename "" stays "".
+    (list (string-downcase (string key))
+          :filename filename :content content :content-type content-type)))
+
+(defun %file-parts (key value)
+  "A cons param VALUE under KEY → fresh list of :files entries, in list order."
+  (cond ((%file-value-p value)
+         (list (%file-part key value)))
+        ((and (consp (car value)) (%proper-list-p value) (every #'%file-value-p value))
+         (mapcar (lambda (one) (%file-part key one)) value))
+        (t (%file-refused key "not a string, an integer, a file value or a list of file values"))))
+
+(defun %split-file-params (params)
+  "PARAMS with a cons value → (values TEXT FILES): TEXT the plist of the other
+params (for %PARAMS-ALIST, so 0.1's drops and refusals apply), FILES the
+:files entries in PARAMS order and list order."
+  (let ((text '())
+        (files '()))
+    (loop for (key value) on params by #'cddr
+          do (if (consp value)
+                 (dolist (part (%file-parts key value))
+                   (push part files))
+                 (progn (push key text) (push value text))))
+    (values (nreverse text) (nreverse files))))
+
 (defun %encode-file-request (codec method params http-method encoding metadata headers)
   "ENCODE-REQUEST-USING-CODEC for PARAMS with a cons value: validate the file
 values, refuse them outside :POST :MULTIPART, and build the multipart body with
 HTTP-PROTOCOL:MAKE-MULTIPART-BODY (text fields as DATA, files as FILES).
 See the file header (File values)."
-  (declare (ignore codec method params http-method encoding metadata headers))
-  (%htmx2-pending 'encode-file-request))
+  (let ((name (%method-string method)))
+    (multiple-value-bind (text files) (%split-file-params params)
+      (unless (and (eq http-method :post) (eq encoding :multipart))
+        (error 'htmx-error
+               :message (format nil "File params need :http-method :post and :encoding :multipart, not ~S ~S"
+                                http-method encoding)))
+      (let ((alist (%params-alist text))
+            (path-info (concatenate 'string (htmx-codec-prefix codec) name)))
+        (multiple-value-bind (body content-type)
+            ;; Translate only: a stack refusal while building the body (a NUL in
+            ;; a filename, from mime-protocol) is a caller bug → HTMX-ERROR 500.
+            (handler-case (%multipart-octets alist files)
+              (stack-mime:mime-error (c)
+                (error 'htmx-error :message (princ-to-string c) :data c))
+              (http-protocol:http-protocol-error (c)
+                (error 'htmx-error :message (princ-to-string c) :data c)))
+          (%encode-env codec :post path-info nil body content-type metadata headers))))))
 
 (defmethod rpc-protocol:encode-request-using-codec
     ((codec htmx-codec) method params &key id (http-method :get) (encoding :urlencoded)

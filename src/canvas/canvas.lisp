@@ -72,17 +72,41 @@
               :documentation "NIL, T or a list of method-name strings (see the file header)."))
   (:documentation "htmx transport serving canvas functions, pages and canvas assets."))
 
+(defun %page-key-name-p (object)
+  "True for one PAGE-KEYS entry: a method symbol or a \"PKG::NAME\" string."
+  (typecase object
+    (string (rpc-backend-htmx::%method-name-p object))
+    (symbol (rpc-backend-htmx::%method-symbol-p object)) ; NIL and keywords refused
+    (t nil)))
+
+(defun %page-key-list-p (object)
+  "True for a non-empty proper list of page-key names."
+  (and (consp object)
+       (null (cdr (last object)))
+       (every #'%page-key-name-p object)))
+
 (defun %page-keys-option (page-keys)
   "MAKE-CANVAS-HTMX-TRANSPORT's non-NIL PAGE-KEYS → T or a fresh list of
-method-name strings; anything else → TYPE-ERROR. See the file header."
-  (declare (ignore page-keys))
-  (rpc-backend-htmx::%htmx2-pending 'page-keys-option))
+method-name strings; anything else → TYPE-ERROR. See the file header.
+NIL (e.g. stored through CHECK-TYPE's STORE-VALUE) → NIL."
+  (check-type page-keys (or null (eql t) (satisfies %page-key-list-p))
+              "NIL, T or a non-empty proper list of method symbols or \"PKG::NAME\" strings")
+  (if (eq page-keys t)
+      t
+      (mapcar (lambda (name)
+                (if (stringp name)
+                    (copy-seq name)
+                    (rpc-backend-htmx:htmx-method-name name)))
+              page-keys)))
 
 (defun %page-keys-p (transport message)
   "True when the full page for MESSAGE loads canvas-keys.js (TRANSPORT's
 PAGE-KEYS is T or lists the message's method). See the file header."
-  (declare (ignore transport message))
-  (rpc-backend-htmx::%htmx2-pending 'page-keys-p))
+  (let ((keys (canvas-transport-page-keys transport)))
+    (or (eq keys t)
+        (and (consp keys)
+             (member (rpc-backend-htmx:htmx-message-method message) keys :test #'string=)
+             t))))
 
 (defun make-canvas-htmx-transport (&key (prefix "/canvas/") (asset-prefix "/canvas-assets/")
                                      (page-title "canvas")

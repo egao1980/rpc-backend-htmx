@@ -413,15 +413,15 @@ own condition boundary."
   (http-server-protocol:serve (htmx-app transport nil :stream-handler handler)
                               :host host :port port :backend backend))
 
-;;; 0.2.0 contract: the refusal's message gains "; JSON-RPC carries no file
-;;; params" (file header). Still 0.1.0's text here; jsonrpc-refuses-file-params
-;;; checks the new one.
 (defun %json-param-value (key value)
+  "One JSON-RPC param VALUE under the JSON KEY → string; file params have no
+JSON-RPC form (file header)."
   (typecase value
     (string value)
     (integer (format nil "~D" value))
     (t (error 'rpc-protocol:rpc-invalid-params
-              :message (format nil "Param ~A must be a string or an integer" key)))))
+              :message (format nil "Param ~A must be a string or an integer; JSON-RPC carries no file params"
+                               key)))))
 
 (defun %json-params-plist (params)
   "JSON-RPC PARAMS (NIL, an empty vector or an object) → keyword plist, keys sorted."
