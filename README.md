@@ -9,7 +9,13 @@ Uploads (0.2.0): a multipart part with a filename reaches the handler as its mim
 
 0.2.1 requires mime-protocol 0.3.1: a part's `name` and `filename` reach the handler as a browser writes them, raw UTF-8 (`Ünïcödé — 楽譜.svg`), a backslash kept, `%22 %0D %0A` read as `"` CR LF (mime-protocol#14).
 
-Design: [cl-stack/docs/capabilities/canvas.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/canvas.md) § H4h-1b. 0.2.0 implements #5 (uploads) and #6 (page keys, `make-canvas-htmx-transport :page-keys`); the exact rules are the file headers in `src/`.
+0.3.0 (contract on this branch; a team-solve run implements it):
+
+- Request keys (#2): names map to keywords with `find-symbol`, never `intern`, so a client cannot grow the KEYWORD package. Each handler accepts its key set, from its lambda list or a declared `:params` (`(people :params (:sort :page))`, `:params t` for any); a param it does not take is a 400 (`htmx-unknown-param`). At most `:max-params` fields per request (default 1000; 413).
+- Zero-arg canvases (#3): `(defun dashboard () …)` is called with no arguments; params sent to it are a 400. A lambda list the server cannot call (a required or `&optional` parameter) is an `htmx-error` when the table is built.
+- CSP and token gate (#4): `:csp` on `make-htmx-transport`, `make-canvas-htmx-transport` and `htmx-app` adds `Content-Security-Policy` to every response, streams and assets included (the canvas transport sends the brief's policy by default; the core is opt-in). `:token` gates the app: `htmx-token-url` gives a one-time URL that sets an HttpOnly, SameSite=Strict cookie; anything else without that cookie is a 403.
+
+Design: [cl-stack/docs/capabilities/canvas.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/canvas.md) § H4h-1b and H4h-2. 0.2.0 implements #5 (uploads) and #6 (page keys, `make-canvas-htmx-transport :page-keys`); 0.3.0 #2, #3 and #4. The exact rules are the file headers in `src/`.
 
 ```sh
 cl-repo test --system rpc-backend-htmx

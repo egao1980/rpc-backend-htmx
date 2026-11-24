@@ -18,8 +18,27 @@
 ;;;   multipart, encoding-protocol for UTF-8. No private parsers.
 ;;;   An empty POST body needs no content type; a non-empty body of any other
 ;;;   type → HTMX-UNSUPPORTED-MEDIA-TYPE. Malformed input → HTMX-BAD-REQUEST.
-;;;   Result: a plist keyword → value. Key = (intern (string-upcase name) :keyword);
-;;;   empty names dropped; first-occurrence order (of any kind of value).
+;;;   Result: a plist keyword → value. Empty names dropped; first-occurrence
+;;;   order (of any kind of value). Names become keys WITHOUT interning (0.3.0,
+;;;   rpc-backend-htmx#2; 0.2.1 interned every name, so any client could grow
+;;;   the KEYWORD package without bound):
+;;;     key = the symbol (FIND-SYMBOL (STRING-UPCASE name) :KEYWORD) finds,
+;;;           when its second value is non-NIL;
+;;;     no such keyword → the name is UNMAPPED: not in the params, listed in
+;;;           HTMX-MESSAGE-UNMAPPED-NAMES — each upcased name once, under its
+;;;           first spelling, in wire order (a fresh list of strings).
+;;;   Nothing a request sends is ever interned (no INTERN, no reader). Every
+;;;   keyword a handler can take already exists — its lambda list or :PARAMS
+;;;   made it (handlers.lisp, Key sets) — so an unmapped name is one no handler
+;;;   takes; the server refuses it or drops it by the handler's key set.
+;;;   Field cap (0.3.0, #2): at most MAX-PARAMS (codec option, default
+;;;   +DEFAULT-MAX-PARAMS+ = 1000) fields that carry a value — query and
+;;;   urlencoded fields with a non-empty name, multipart parts with a
+;;;   non-empty name other than empty file inputs — counted together over the
+;;;   query and the body, duplicates and unmapped names included. More →
+;;;   HTMX-TOO-MANY-PARAMS (413, :limit MAX-PARAMS), before any name is
+;;;   mapped. 413 like HTMX-BODY-TOO-LARGE: the request is well formed, only
+;;;   bigger than the server takes (400 stays "malformed").
 ;;;   Values:
 ;;;   - text (a query field, a urlencoded field, a multipart part without a
 ;;;     filename): a string; a later text duplicate (query then body) replaces
@@ -160,6 +179,9 @@
 (defconstant +default-max-body-bytes+ 1048576
   "Default request body limit (1 MiB).")
 
+(defconstant +default-max-params+ 1000
+  "Default limit on the fields of one request (0.3.0, #2): codec.lisp header, Params.")
+
 (defparameter +request-metadata-headers+
   '(("hx-request" . :request)
     ("hx-target" . :target)
@@ -179,14 +201,21 @@
   ((prefix :initarg :prefix :initform "/" :reader htmx-codec-prefix
            :documentation "Mount prefix; method names follow it in the path. Ends with /.")
    (max-body-bytes :initarg :max-body-bytes :initform +default-max-body-bytes+
-                   :reader htmx-codec-max-body-bytes))
+                   :reader htmx-codec-max-body-bytes)
+   (max-params :initarg :max-params :initform +default-max-params+
+               :reader htmx-codec-max-params
+               :documentation "Most fields one request may carry (0.3.0, #2)."))
   (:documentation "htmx requests ↔ rpc messages; fragments ↔ responses."))
 
-(defun make-htmx-codec (&key (prefix "/") (max-body-bytes +default-max-body-bytes+))
-  "PREFIX a string starting and ending with /; MAX-BODY-BYTES a non-negative integer."
+(defun make-htmx-codec (&key (prefix "/") (max-body-bytes +default-max-body-bytes+)
+                          (max-params +default-max-params+))
+  "PREFIX a string starting and ending with /; MAX-BODY-BYTES and MAX-PARAMS
+non-negative integers (else TYPE-ERROR)."
   (check-type prefix (and string (satisfies %slash-bounded-p)))
   (check-type max-body-bytes (integer 0))
-  (make-instance 'htmx-codec :prefix prefix :max-body-bytes max-body-bytes))
+  (check-type max-params (integer 0))
+  (make-instance 'htmx-codec :prefix prefix :max-body-bytes max-body-bytes
+                             :max-params max-params))
 
 (defun %slash-bounded-p (string)
   "True for a non-empty string that starts and ends with /."
@@ -200,6 +229,10 @@
    (params :initarg :params :initform nil :reader htmx-message-params
            :documentation "Plist keyword → string, STACK-MIME:MIME-ENTITY (a file part)
 or a list of entities (several files under one name). See the file header.")
+   (unmapped-names :initarg :unmapped-names :initform nil
+                   :reader htmx-message-unmapped-names
+                   :documentation "Param names that named no keyword (0.3.0, #2), as sent,
+in wire order. See the file header (Params).")
    (metadata :initarg :metadata :initform nil :reader htmx-message-metadata
              :documentation "Plist, see +REQUEST-METADATA-HEADERS+.")
    (mode :initarg :mode :initform :call-response :reader htmx-message-mode
@@ -382,6 +415,24 @@ the entity, several → a fresh list in part order). See the file header."
                         ((null (rest files)) (first files))
                         (t (reverse files))))))
 
+;;; 0.3.0 contract (rpc-backend-htmx#2): names map through %NAME-KEY
+;;; (FIND-SYMBOL, never INTERN), unmapped names go to the message's
+;;; UNMAPPED-NAMES, and %CHECK-PARAM-COUNT runs on all the pairs (query then
+;;; body) before any name is mapped. File header, Params. %PARAMS-PLIST and
+;;; %FILE-PARAMS-PLIST still INTERN here, as 0.2.1 did.
+
+(defun %name-key (name)
+  "The keyword the param NAME maps to, or NIL when NAME is unmapped.
+Never interns (FIND-SYMBOL in KEYWORD). See the file header (Params)."
+  (declare (ignore name))
+  (%htmx3-pending 'name-key))
+
+(defun %check-param-count (pairs limit)
+  "Signal HTMX-TOO-MANY-PARAMS (:limit LIMIT) when PAIRS — the value-carrying
+fields of one request, query then body — are more than LIMIT."
+  (declare (ignore pairs limit))
+  (%htmx3-pending 'check-param-count))
+
 (defun %params-plist (pairs)
   "PAIRS in wire order → keyword plist; first-occurrence order, later
 duplicates replace the value in place. Values stay strings.
@@ -431,6 +482,8 @@ duplicates replace the value in place. Values stay strings.
           (let ((body (%read-request-body env (htmx-codec-max-body-bytes codec))))
             (when (plusp (length body))
               (setf pairs (append pairs (%body-pairs env body))))))
+        ;; 0.3.0 contract: (%check-param-count pairs max-params) here, then
+        ;; :params without interning and :unmapped-names (file header, Params).
         (make-instance 'htmx-message
                        :method rest
                        :params (%params-plist pairs)

@@ -7,6 +7,23 @@
 ;;; escape a request: HTMX-ERROR-RESPONSE turns it into a status + error
 ;;; fragment (see server.lisp). Extension point: methods on
 ;;; HTMX-CONDITION-STATUS / HTMX-ERROR-RESPONSE, not a private error dialect.
+;;;
+;;; 0.3.0 adds three: HTMX-UNKNOWN-PARAM (400, a param the handler's key set
+;;; refuses: handlers.lisp, Key sets), HTMX-TOO-MANY-PARAMS (413, more fields
+;;; than the codec's MAX-PARAMS: codec.lisp) and HTMX-FORBIDDEN (403, the token
+;;; gate: server.lisp). Their slots and reports are final; signalling them is
+;;; the 0.3.0 run's work.
+
+(define-condition htmx3-pending (error)
+  ((name :initarg :name :reader htmx3-pending-name))
+  (:report (lambda (c s)
+             (format s "0.3.0 pending: ~A is not implemented yet" (htmx3-pending-name c)))))
+
+(defun %htmx3-pending (name)
+  "Stub marker for the 0.3.0 team-solve run (#2 request keys, #3 zero-arg
+canvases, #4 CSP and token gate). Not an HTMX-ERROR on purpose: no test can
+pass by catching it."
+  (error 'htmx3-pending :name name))
 
 (define-condition htmx-error (rpc-protocol:rpc-error)
   ((status :initarg :status :initform 500 :reader htmx-error-status
@@ -20,6 +37,20 @@
   (:default-initargs :status 400 :code rpc-protocol:+invalid-request+
                      :message "Bad request")
   (:documentation "Malformed query string, form body, percent-escape or UTF-8."))
+
+(define-condition htmx-unknown-param (htmx-bad-request)
+  ((name :initarg :name :initform nil :reader htmx-unknown-param-name
+         :documentation "The refused param name, downcased (handlers.lisp, Accepting a request)."))
+  (:default-initargs :code rpc-protocol:+invalid-params+ :message "Unknown param")
+  (:documentation "A request param the handler's key set does not accept (#2, #3).
+400 over htmx; code -32602 (invalid params) over JSON-RPC. The signaller passes
+:message \"Unknown param <name>\"."))
+
+(define-condition htmx-forbidden (htmx-error) ()
+  (:default-initargs :status 403 :code rpc-protocol:+invalid-request+
+                     :message "Forbidden")
+  (:documentation "The token gate refused the request (#4): no valid cookie, a bad
+token, or a one-time URL already used. server.lisp, Token gate."))
 
 (define-condition htmx-method-not-allowed (htmx-error) ()
   (:default-initargs :status 405 :code rpc-protocol:+invalid-request+
@@ -36,6 +67,14 @@
          :documentation "Content-Length when the request declared one, else NIL."))
   (:default-initargs :status 413 :code rpc-protocol:+invalid-request+
                      :message "Request body too large"))
+
+(define-condition htmx-too-many-params (htmx-error)
+  ((limit :initarg :limit :reader htmx-params-limit
+          :documentation "The max-params in force."))
+  (:default-initargs :status 413 :code rpc-protocol:+invalid-request+
+                     :message "Too many request params")
+  (:documentation "More fields in one request than the codec's MAX-PARAMS (#2):
+codec.lisp, Params. JSON-RPC: more members than that."))
 
 (define-condition htmx-unsupported-media-type (htmx-error)
   ((content-type :initarg :content-type :initform nil :reader htmx-error-content-type))
