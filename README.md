@@ -7,6 +7,8 @@ htmx requests as rpc-protocol calls (slice H4h-1b): hx-get / hx-post → `:call-
 
 Uploads (0.2.0): a multipart part with a filename reaches the handler as its mime-protocol entity (several under one name: a list), ready for canvas-protocol's `coerce-param :file`; an empty file input is a missing param. `htmx-request … :http-method :post :encoding :multipart` sends file values `(:filename "a.svg" :content octets :content-type "image/svg+xml")` as raw binary parts. JSON-RPC carries no file params.
 
+0.2.1 requires mime-protocol 0.3.1: a part's `name` and `filename` reach the handler as a browser writes them, raw UTF-8 (`Ünïcödé — 楽譜.svg`), a backslash kept, `%22 %0D %0A` read as `"` CR LF (mime-protocol#14).
+
 Design: [cl-stack/docs/capabilities/canvas.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/canvas.md) § H4h-1b. 0.2.0 implements #5 (uploads) and #6 (page keys, `make-canvas-htmx-transport :page-keys`); the exact rules are the file headers in `src/`.
 
 ```sh

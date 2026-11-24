@@ -1,5 +1,5 @@
 (defsystem "rpc-backend-htmx"
-  :version "0.2.0"
+  :version "0.2.1"
   :description "htmx as an rpc-protocol transport + codec: Clack server, SSE streams, multipart uploads, test client (H4h-1b)"
   :author "egao1980"
   :license "MIT"
@@ -9,7 +9,7 @@
                (:version "sse-protocol" "0.1.1")
                (:version "sse-backend-clack" "0.1.1")
                (:version "html-protocol" "0.1.1")
-               (:version "mime-protocol" "0.3.0")
+               (:version "mime-protocol" "0.3.1")
                (:version "encoding-protocol" "0.2.0")
                "quri")
   :serial t
@@ -23,7 +23,7 @@
   :in-order-to ((test-op (test-op "rpc-backend-htmx/tests"))))
 
 (defsystem "rpc-backend-htmx/canvas"
-  :version "0.2.0"
+  :version "0.2.1"
   :description "canvas-protocol resolver + page/asset routes for rpc-backend-htmx (H4h-1b)"
   :author "egao1980"
   :license "MIT"
@@ -42,7 +42,7 @@
                (:version "json-backend-jzon" "0.2.3")
                (:version "rpc-backend-http" "0.1.2")
                (:version "html-backend-plump" "0.1.1")
-               "rove")
+               (:version "rove" "0.11.1"))
   :pathname "tests"
   :serial t
   :components ((:file "package")

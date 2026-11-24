@@ -135,7 +135,7 @@ the boundary (CR LF --XyZ CR LF) and \"--\" inside, and it ends in CR LF.")
 (deftest multipart-filename-is-mime-protocols
   ;; FILENAME is the client's, as mime-protocol reads it: filename* (RFC 8187)
   ;; preferred, nothing reduced or cleaned here (canvas-protocol does that).
-  ;; A browser's raw UTF-8 filename and a backslash in it are mime-protocol#14.
+  ;; A browser's raw UTF-8 filename and a backslash in it: the next test.
   (let ((params (mp-params
                  (list (mp-part '("Content-Disposition: form-data; name=\"a\"; filename=\"Prelude.svg\"; filename*=UTF-8''Pr%C3%A9lude.svg"
                                   "Content-Type: image/svg+xml")
@@ -148,6 +148,48 @@ the boundary (CR LF --XyZ CR LF) and \"--\" inside, and it ends in CR LF.")
                                               +svg+))))
                'h:htmx-bad-request)
       "a filename* mime-protocol cannot read → 400, not a 500"))
+
+(defparameter +utf8-filename+ "Ünïcödé — 楽譜.svg"
+  "A filename with Latin-1, General Punctuation and CJK characters.")
+
+(deftest multipart-browser-names
+  ;; 0.2.1, mime-protocol ≥ 0.3.1 (mime-protocol#14). A browser writes a
+  ;; form-data name and filename as raw UTF-8 in a quoted string, sends no
+  ;; filename*, encodes only " CR LF (as %22 %0D %0A) and never a quoted-pair
+  ;; (RFC 7578 §2, §4.2; HTML's form-data encoding). mime-protocol 0.3.0 read
+  ;; such headers as ISO-8859-1 and dropped a backslash as an escape.
+  ;; The parsed parts are not re-printed (mime-protocol#16).
+  (setf *seen* nil)
+  (let* ((r (h:htmx-request-env
+             (client)
+             (mp-env (list (mp-file "score" +utf8-filename+ +binary+ "image/svg+xml")
+                           (mp-text "say%22hi%22" "q")
+                           (mp-file "path%22s" "C:\\fakepath\\a\\b.svg" +svg+ "image/svg+xml")
+                           (mp-file "quoted" "%22x%22%0D%0A.svg" (bytes 1 2 3))
+                           (mp-part (list (bytes "Content-Disposition: form-data; name=\"latin\"; filename=\"caf"
+                                                 #xE9 ".txt\""))
+                                    (bytes 4))))))
+         (seen (first *seen*))
+         (score (getf seen :score))
+         (path (getf seen :|PATH"S|)))
+    (ok (= 200 (h:htmx-reply-status r)))
+    (ok (equal '(:score :|SAY"HI"| :|PATH"S| :quoted :latin) (param-keys seen))
+        "%22 in a name is a quote, in the key too")
+    (ok (part-p score) "the handler's param is the mime-protocol entity")
+    (ok (equal "score" (part-name score)))
+    (ok (equal +utf8-filename+ (part-filename score)) "a raw UTF-8 filename reads back")
+    (ok (equal "image/svg+xml" (part-type score)))
+    (ok (equalp +binary+ (part-octets score)) "octets intact beside a UTF-8 header")
+    (ok (equal "q" (getf seen :|SAY"HI"|)) "a text field whose name holds %22")
+    (ok (part-p path))
+    (ok (equal "path\"s" (part-name path)))
+    (ok (equal "C:\\fakepath\\a\\b.svg" (part-filename path)) "backslashes are literal")
+    (ok (equalp (octets +svg+) (part-octets path)))
+    (ok (equal (format nil "\"x\"~C~C.svg" #\Return #\Linefeed)
+               (part-filename (getf seen :quoted)))
+        "%22 %0D %0A in a filename → \" CR LF")
+    (ok (equal (format nil "caf~C.txt" (code-char #xE9)) (part-filename (getf seen :latin)))
+        "a header that is not valid UTF-8 keeps the ISO-8859-1 reading")))
 
 (deftest multipart-empty-file-input-is-missing
   (let ((params (mp-params (list (mp-text "title" "T") (mp-empty-file "photo")))))
