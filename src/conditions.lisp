@@ -11,19 +11,9 @@
 ;;; 0.3.0 adds three: HTMX-UNKNOWN-PARAM (400, a param the handler's key set
 ;;; refuses: handlers.lisp, Key sets), HTMX-TOO-MANY-PARAMS (413, more fields
 ;;; than the codec's MAX-PARAMS: codec.lisp) and HTMX-FORBIDDEN (403, the token
-;;; gate: server.lisp). Their slots and reports are final; signalling them is
-;;; the 0.3.0 run's work.
-
-(define-condition htmx3-pending (error)
-  ((name :initarg :name :reader htmx3-pending-name))
-  (:report (lambda (c s)
-             (format s "0.3.0 pending: ~A is not implemented yet" (htmx3-pending-name c)))))
-
-(defun %htmx3-pending (name)
-  "Stub marker for the 0.3.0 team-solve run (#2 request keys, #3 zero-arg
-canvases, #4 CSP and token gate). Not an HTMX-ERROR on purpose: no test can
-pass by catching it."
-  (error 'htmx3-pending :name name))
+;;; gate: server.lisp). Their slots and reports are final; each is signalled
+;;; where it is detected (%ACCEPT-PARAMS, %CHECK-PARAM-COUNT / %JSON-PAIRS, the
+;;; token gate).
 
 (define-condition htmx-error (rpc-protocol:rpc-error)
   ((status :initarg :status :initform 500 :reader htmx-error-status

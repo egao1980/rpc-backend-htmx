@@ -9,7 +9,7 @@ Uploads (0.2.0): a multipart part with a filename reaches the handler as its mim
 
 0.2.1 requires mime-protocol 0.3.1: a part's `name` and `filename` reach the handler as a browser writes them, raw UTF-8 (`Ünïcödé — 楽譜.svg`), a backslash kept, `%22 %0D %0A` read as `"` CR LF (mime-protocol#14).
 
-0.3.0 (contract on this branch; a team-solve run implements it):
+0.3.0:
 
 - Request keys (#2): names map to keywords with `find-symbol`, never `intern`, so a client cannot grow the KEYWORD package. Each handler accepts its key set, from its lambda list or a declared `:params` (`(people :params (:sort :page))`, `:params t` for any); a param it does not take is a 400 (`htmx-unknown-param`). At most `:max-params` fields per request (default 1000; 413).
 - Zero-arg canvases (#3): `(defun dashboard () …)` is called with no arguments; params sent to it are a 400. A lambda list the server cannot call (a required or `&optional` parameter) is an `htmx-error` when the table is built.

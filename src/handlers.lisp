@@ -117,12 +117,24 @@ SSE extension → :call-stream (one HTML fragment per SSE event, named by its ev
 HTMX-HANDLER-NAMES / HTMX-HANDLER-KEYS."))
   (:documentation "Method name → (function, mode, key set). The server's allowlist."))
 
-;;; ENTRIES slot: a simple-vector of (name function-or-symbol mode) in
-;;; registration order. Lookup is a linear STRING= search: tables are small,
-;;; and there is no hash table whose iteration order could reach output.
-;;; 0.3.0 contract: an entry also holds its key set (or its :PARAMS) and, for
-;;; a symbol entry, the function that key set came from (Key sets, When).
-;;; Still 0.2.1's three elements here.
+;;; ENTRIES slot: a simple-vector of %ENTRY structures in registration order.
+;;; Lookup is a linear STRING= search: tables are small, and there is no hash
+;;; table whose iteration order could reach output. An entry holds its key
+;;; set: the :PARAMS one when declared, else the derived one together with the
+;;; function it came from (Key sets, When).
+
+(defstruct (%entry (:constructor %make-entry (name callee mode params-p params))
+                   (:copier nil) (:predicate nil))
+  (name "" :type string :read-only t)
+  (callee nil :type (or symbol function) :read-only t) ; the symbol, or a function object
+  (mode :call-response :type keyword :read-only t)
+  (params-p nil :read-only t)           ; :PARAMS was given
+  (params nil :read-only t)             ; that key set
+  ;; NIL, or (source-function . key-set): the derived key set and the function
+  ;; it came from, in ONE cons replaced by one SETF, so a concurrent request
+  ;; never pairs a key set with another function. A failed derivation is never
+  ;; stored: the next request derives (and signals) again.
+  (derived nil))
 
 (defun %method-symbol-p (object)
   "True for an interned, non-keyword symbol (one that can name a method)."
@@ -147,34 +159,95 @@ HTMX-HANDLER-NAMES / HTMX-HANDLER-KEYS."))
   (concatenate 'string (package-name (symbol-package symbol)) "::" (symbol-name symbol)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Key sets (0.3.0 contract: stubs)
+;;; Key sets (0.3.0)
 ;;; ---------------------------------------------------------------------------
 
 (defun %params-option (params)
   "An entry's :PARAMS value → its key set (T or a fresh list of keywords), or
 HTMX-ERROR 500. See the file header (Key sets)."
-  (declare (ignore params))
-  (%htmx3-pending 'params-option))
+  (cond ((eq params t) t)
+        ((and (listp params) (null (cdr (last params))) (every #'keywordp params))
+         (let ((keys '()))
+           (dolist (key params (nreverse keys))
+             (pushnew key keys :test #'eq))))  ; a repeated key kept once, first place
+        (t (%bad-entry "Handler :params must be T or a proper list of keywords: ~S" params))))
 
 (defun %function-lambda-list (function)
   "(values lambda-list reportedp) for FUNCTION, as the implementation reports
 it (SBCL, ECL; elsewhere not reported). See the file header (Key sets)."
-  (declare (ignore function))
-  (%htmx3-pending 'function-lambda-list))
+  (declare (ignorable function))
+  #+sbcl
+  (if (typep function 'generic-function)
+      (values (sb-mop:generic-function-lambda-list function) t)
+      (let ((lambda-list (sb-kernel:%fun-lambda-list function)))
+        (if (listp lambda-list)           ; :UNKNOWN under (debug 0)
+            (values lambda-list t)
+            (values nil nil))))
+  #+ecl
+  (multiple-value-bind (lambda-list reportedp) (ext:function-lambda-list function)
+    (if (and reportedp (listp lambda-list))
+        (values lambda-list t)
+        (values nil nil)))
+  #-(or sbcl ecl)
+  (values nil nil))
+
+(defun %lambda-list-key (parameter)
+  "The request key of one &key PARAMETER: VAR or (VAR …) → the keyword named
+like VAR; ((KEY VAR) …) → KEY when it is a keyword, else NIL (no request can
+name it). Interns, on trusted code only: the lambda list a handler was compiled
+with, never a request name."
+  (let ((head (if (consp parameter) (car parameter) parameter)))
+    (cond ((consp head) (and (keywordp (car head)) (car head)))
+          ((and head (symbolp head)) (intern (symbol-name head) :keyword))
+          (t nil))))
+
+(defun %print-lambda-list (lambda-list)
+  "LAMBDA-LIST as the shape error prints it (file header, Key sets)."
+  (with-standard-io-syntax
+    (let ((*package* (find-package "COMMON-LISP"))
+          (*print-readably* nil))
+      (prin1-to-string lambda-list))))
 
 (defun %lambda-list-key-set (lambda-list mode name)
   "The key set of a reported LAMBDA-LIST for an entry NAMEd (a method name)
 with MODE; a shape the server cannot call → HTMX-ERROR 500 (exact message in
 the file header)."
-  (declare (ignore lambda-list mode name))
-  (%htmx3-pending 'lambda-list-key-set))
+  (let ((state :required) (required 0) (optional 0)
+        (rest-p nil) (key-p nil) (other-keys-p nil) (keys '()))
+    (dolist (parameter lambda-list)
+      (if (member parameter lambda-list-keywords :test #'eq)
+          (setf state (case parameter
+                        (&optional :optional)
+                        ((&rest &body) (setf rest-p t) :ignore)
+                        (&key (setf key-p t) :key)
+                        (&allow-other-keys (setf other-keys-p t) :ignore)
+                        (otherwise :ignore))) ; &aux, and defensively &whole &environment …
+          (case state
+            (:required (incf required))
+            (:optional (incf optional))
+            (:key (let ((key (%lambda-list-key parameter)))
+                    (when key (push key keys)))))))
+    (unless (and (zerop optional)
+                 (= required (if (eq mode :call-stream) 1 0)))
+      (%bad-entry "Handler ~A cannot take request params: ~A"
+                  name (%print-lambda-list lambda-list)))
+    (cond ((or other-keys-p (and rest-p (not key-p))) t)
+          (key-p (nreverse keys))
+          (t nil))))
 
 (defun %accept-params (key-set params unmapped)
   "PARAMS (keyword plist) and UNMAPPED (names that named no keyword) against
 KEY-SET: return normally when accepted, else signal HTMX-UNKNOWN-PARAM. See the
 file header (Accepting a request)."
-  (declare (ignore key-set params unmapped))
-  (%htmx3-pending 'accept-params))
+  (unless (eq key-set t)
+    (let ((refused (or (loop for (key) on params by #'cddr
+                             unless (member key key-set :test #'eq)
+                               return (string-downcase (symbol-name key)))
+                       (and unmapped (string-downcase (first unmapped))))))
+      (when refused
+        (error 'htmx-unknown-param :name refused
+                                   :message (format nil "Unknown param ~A" refused)))))
+  (values))
 
 (defun %entry-options (options)
   "(values mode params-option params-p) from an entry's option tail (:mode m
@@ -192,34 +265,58 @@ file header (Accepting a request)."
             (and params-p (%params-option (getf options :params)))
             params-p)))
 
-(defun %entry-mode (options)
-  "Mode from an entry's option tail, default :CALL-RESPONSE."
-  (values (%entry-options options)))
+(defun %derive-key-set (entry function)
+  "The key set FUNCTION's reported lambda list gives ENTRY; NIL when not reported."
+  (multiple-value-bind (lambda-list reportedp) (%function-lambda-list function)
+    (if reportedp
+        (%lambda-list-key-set lambda-list (%entry-mode entry) (%entry-name entry))
+        nil)))
+
+(defun %entry-key-set (entry)
+  "The key set ENTRY's next call uses: its :PARAMS, or derived (again, for a
+symbol entry whose definition changed). See the file header (Key sets, When)."
+  (if (%entry-params-p entry)
+      (%entry-params entry)
+      (let* ((callee (%entry-callee entry))
+             ;; Unbound at request time → UNDEFINED-FUNCTION (500), as in 0.2.1.
+             (function (if (functionp callee) callee (fdefinition callee)))
+             (derived (%entry-derived entry))) ; read once: never a mixed pair
+        (if (and derived (eq (car derived) function))
+            (cdr derived)
+            (let ((key-set (%derive-key-set entry function))) ; a signal leaves DERIVED as it was
+              (setf (%entry-derived entry) (cons function key-set))
+              key-set)))))
 
 (defun %parse-entry (entry)
-  "ENTRY → (name function-or-symbol mode), or HTMX-ERROR.
-0.3.0 contract: plus its key set, derived when possible (file header, When);
-still 0.2.1 here."
-  (cond ((%method-symbol-p entry)
-         (list (htmx-method-name entry) entry :call-response))
-        ((and (consp entry) (%method-symbol-p (car entry)))
-         (list (htmx-method-name (car entry)) (car entry) (%entry-mode (cdr entry))))
-        ((and (consp entry) (stringp (car entry)) (consp (cdr entry)))
-         (let ((name (first entry)) (fn (second entry)))
-           (unless (%method-name-p name)
-             (%bad-entry "Handler name must be \"PKG::NAME\": ~S" name))
-           (unless (functionp fn)
-             (%bad-entry "Handler for ~A is not a function: ~S" name fn))
-           (list name fn (%entry-mode (cddr entry)))))
-        (t (%bad-entry "Malformed handler entry ~S" entry))))
+  "ENTRY → an %ENTRY, or HTMX-ERROR. A function entry, and a symbol entry whose
+symbol is fbound, derive their key set here, so a bad shape fails in
+MAKE-HTMX-HANDLERS (file header, When)."
+  (multiple-value-bind (name callee options)
+      (cond ((%method-symbol-p entry)
+             (values (htmx-method-name entry) entry '()))
+            ((and (consp entry) (%method-symbol-p (car entry)))
+             (values (htmx-method-name (car entry)) (car entry) (cdr entry)))
+            ((and (consp entry) (stringp (car entry)) (consp (cdr entry)))
+             (let ((name (first entry)) (fn (second entry)))
+               (unless (%method-name-p name)
+                 (%bad-entry "Handler name must be \"PKG::NAME\": ~S" name))
+               (unless (functionp fn)
+                 (%bad-entry "Handler for ~A is not a function: ~S" name fn))
+               (values name fn (cddr entry))))
+            (t (%bad-entry "Malformed handler entry ~S" entry)))
+    (multiple-value-bind (mode params params-p) (%entry-options options)
+      (let ((parsed (%make-entry name callee mode params-p params)))
+        (when (and (not params-p) (or (functionp callee) (fboundp callee)))
+          (%entry-key-set parsed))
+        parsed))))
 
 (defun make-htmx-handlers (&rest entries)
   "A handler table from ENTRIES (see the file header)."
   (let ((parsed '()))
     (dolist (entry entries)
       (let ((e (%parse-entry entry)))
-        (when (find (first e) parsed :key #'first :test #'string=)
-          (%bad-entry "Duplicate handler name ~A" (first e)))
+        (when (find (%entry-name e) parsed :key #'%entry-name :test #'string=)
+          (%bad-entry "Duplicate handler name ~A" (%entry-name e)))
         (push e parsed)))
     (make-instance 'htmx-handlers :entries (coerce (nreverse parsed) 'simple-vector))))
 
@@ -229,29 +326,24 @@ still 0.2.1 here."
 
 (defun %find-entry (handlers name)
   (and (stringp name)
-       (find name (%handler-entries handlers) :key #'first :test #'string=)))
+       (find name (%handler-entries handlers) :key #'%entry-name :test #'string=)))
 
 (defun find-htmx-handler (handlers name)
   "(values function mode) for the method NAME (a string) in HANDLERS, or NIL."
   (let ((entry (%find-entry handlers name)))
     (if entry
-        (values (second entry) (third entry))
+        (values (%entry-callee entry) (%entry-mode entry))
         nil)))
-
-(defun %entry-key-set (entry)
-  "The key set ENTRY's next call uses: its :PARAMS, or derived (again, for a
-symbol entry whose definition changed). See the file header (Key sets, When)."
-  (declare (ignore entry))
-  (%htmx3-pending 'entry-key-set))
 
 (defun htmx-handler-keys (handlers name)
   "(values key-set T) for the method NAME in HANDLERS, (values NIL NIL) when
 NAME is not in it. See the file header (Key sets)."
   (let ((entry (%find-entry handlers name)))
     (if entry
-        (values (%entry-key-set entry) t)
+        (let ((key-set (%entry-key-set entry)))
+          (values (if (listp key-set) (copy-list key-set) key-set) t))
         (values nil nil))))
 
 (defun htmx-handler-names (handlers)
   "Method names in HANDLERS, in registration order (fresh list)."
-  (map 'list #'first (%handler-entries handlers)))
+  (map 'list #'%entry-name (%handler-entries handlers)))
