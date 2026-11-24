@@ -2,12 +2,23 @@
 
 ;;; Server transport: a Clack app (http-server-protocol's app contract).
 ;;;
-;;; (HTMX-APP transport handler &key stream-handler) → (lambda (env) → response)
+;;; (HTMX-APP transport handler &key stream-handler csp token token-name)
+;;;   → (lambda (env) → response)
 ;;;   HANDLER: an HTMX-HANDLERS table, a function (method params) → (values result
 ;;;   response-headers) as rpc-protocol's BACKEND-RPC-SERVE takes, or NIL.
 ;;;   STREAM-HANDLER: a function (mode method params stream), as
-;;;   BACKEND-RPC-SERVE-STREAM takes, or NIL. The app calls
-;;;   (HTMX-HANDLE-REQUEST transport handler stream-handler env).
+;;;   BACKEND-RPC-SERVE-STREAM takes, or NIL.
+;;;   CSP, TOKEN, TOKEN-NAME (0.3.0, #4): when supplied (NIL included) they
+;;;   replace the transport's (HTMX-TRANSPORT-CSP …) for this app, validated as
+;;;   MAKE-HTMX-TRANSPORT validates them (TYPE-ERROR when HTMX-APP is called).
+;;;   Per request the app (1) runs the token gate when a token is in force
+;;;   (Token gate, below); (2) calls (HTMX-HANDLE-REQUEST transport handler
+;;;   stream-handler env) when the gate lets the request through; (3) adds the
+;;;   CSP header to whatever (1) or (2) answered (Content-Security-Policy,
+;;;   below). HTMX-HANDLE-REQUEST called directly does neither: both belong to
+;;;   the app, so they cover the canvas asset route and the canvas :around too.
+;;;   With no token and no CSP in force, (1) and (3) change nothing: the app
+;;;   answers what HTMX-HANDLE-REQUEST answers, as in 0.2.1.
 ;;;
 ;;; HTMX-HANDLE-REQUEST (default method), per request:
 ;;; 1. Decode ENV with the transport's codec. Any condition → step 5.
@@ -20,7 +31,14 @@
 ;;;      else HANDLER (absent → 404). The function signals RPC-METHOD-NOT-FOUND
 ;;;      itself for methods it does not know.
 ;;; 3. Call it with *HTMX-REQUEST* bound to the message (calling convention:
-;;;    handlers.lisp). A function handler is called (funcall handler method params).
+;;;    handlers.lisp). A table entry first takes the entry's key set (deriving
+;;;    it again when a symbol was redefined) and accepts the request against it
+;;;    (handlers.lisp, Accepting a request): refused → HTMX-UNKNOWN-PARAM, 400,
+;;;    nothing called (for a :call-stream entry: before any stream opens, so a
+;;;    plain 400 error response, not an SSE reply). 0.3.0 calls (apply fn
+;;;    params), never with :allow-other-keys (#3).
+;;;    A function handler is called (funcall handler method params): PARAMS as
+;;;    decoded, unmapped names left out (they are on the message).
 ;;; 4. Respond:
 ;;;    :call-response → 200, body from HTMX-RESULT-NODES of the result, passed
 ;;;      through HTMX-FULL-PAGE when the request is a GET without HX-Request;
@@ -48,8 +66,9 @@
 ;;; HTMX-FULL-PAGE (transport nodes message) → nodes or an html-document.
 ;;;   Default: NODES unchanged (fragment). /canvas wraps in canvas PAGE.
 ;;; HTMX-CONDITION-STATUS (transport condition) → HTTP status:
-;;;   HTMX-ERROR → its status; RPC-METHOD-NOT-FOUND 404; RPC-INVALID-PARAMS 422;
-;;;   any other condition 500.
+;;;   HTMX-ERROR → its status (0.3.0: HTMX-UNKNOWN-PARAM 400, HTMX-FORBIDDEN 403,
+;;;   HTMX-TOO-MANY-PARAMS 413); RPC-METHOD-NOT-FOUND 404; RPC-INVALID-PARAMS
+;;;   422; any other condition 500.
 ;;; HTMX-ERROR-RESPONSE (transport condition) → Clack response:
 ;;;   ENCODE-ERROR-RESPONSE-USING-CODEC with that status, the condition's report
 ;;;   (PRINC-TO-STRING) as the message, the transport's error target and swap.
@@ -76,6 +95,116 @@
 ;;;   BACKEND-RPC-SERVE-STREAM (htmx-transport handler &key host port backend)
 ;;;   → the same with HANDLER as the stream handler and no unary handler.
 ;;;   Defaults: host "127.0.0.1", port 8080, backend HTTP-SERVER-PROTOCOL:*HTTP-SERVER-BACKEND*.
+;;;   Both serve the transport's CSP and token (they call HTMX-APP without overrides).
+;;;
+;;; MAKE-HTMX-TRANSPORT &key prefix max-body-bytes max-params error-target
+;;;   error-swap csp token token-name. MAX-PARAMS (0.3.0) goes to the codec
+;;;   (codec.lisp, Params). CSP, TOKEN, TOKEN-NAME below; readers
+;;;   HTMX-TRANSPORT-CSP, HTMX-TRANSPORT-TOKEN, HTMX-TRANSPORT-TOKEN-NAME.
+;;;
+;;; Content-Security-Policy (0.3.0, rpc-backend-htmx#4). CSP is:
+;;;   NIL (the default of MAKE-HTMX-TRANSPORT) — no header: the core serves
+;;;     arbitrary handler HTML, so its policy is opt-in, and every response
+;;;     stays byte-identical to 0.2.1, headers included.
+;;;   T — +DEFAULT-CSP+, the canvas brief's policy (cl-stack
+;;;     docs/capabilities/canvas.md § H4h-2), exactly:
+;;;       default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'
+;;;   a non-empty string holding no control character (code below 32, or 127)
+;;;     — sent as given.
+;;;   Anything else → TYPE-ERROR (CHECK-TYPE). HTMX-TRANSPORT-CSP → NIL or the
+;;;   policy string (T already resolved). rpc-backend-htmx/canvas defaults it
+;;;   to T (canvas.lisp, Security).
+;;; With a policy in force the app adds (:content-security-policy POLICY) as
+;;; the LAST header of every response it returns, whatever produced it:
+;;; fragments, full pages, 204s, every error status (400 403 404 405 406 413
+;;; 415 422 500, the fallback 500), the gate's 303 and 403, asset responses
+;;; (octet bodies), and streams. A Clack streaming response (a function of a
+;;; responder) is wrapped so the (status headers) it hands its responder gets
+;;; the header the same way; the events are untouched. Exactly one such header
+;;; per response; bodies are never changed.
+;;;
+;;; Token gate (0.3.0, #4). Two secrets, never the same value:
+;;;   the BOOTSTRAP token — TOKEN, the caller's; it travels in the one-time URL,
+;;;     and URLs leak (browser history, Referer, proxy and server logs,
+;;;     terminal scrollback), so it is good for exactly one exchange;
+;;;   the SESSION secret — the app's own, the only value the cookie ever
+;;;     carries. Never in a URL, never derived from TOKEN.
+;;; TOKEN is:
+;;;   NIL (default) — no gate (0.2.1).
+;;;   a string, or an HTTP-PROTOCOL:SECRET wrapping one, of 32 to 512
+;;;     characters from [A-Za-z0-9_-] (base64url or hex: safe unencoded in a
+;;;     URL). The caller makes it from a CSPRNG, once per run (e.g.
+;;;     SECRETS-PROTOCOL:TOKEN-URLSAFE 32). Kept as an HTTP-PROTOCOL:SECRET
+;;;     (prints redacted); HTMX-TRANSPORT-TOKEN returns that SECRET.
+;;;   Anything else → TYPE-ERROR.
+;;; The session secret: (SECRETS-PROTOCOL:TOKEN-URLSAFE 32) — 32 octets (256
+;;;   bits) from the stack's CSPRNG, base64url without padding (43
+;;;   characters) — made by HTMX-APP for each app it builds while a token is in
+;;;   force, so a missing secrets backend fails there (SECRETS-PROTOCOL:
+;;;   SECRETS-ERROR; loading crypto-backend-ironclad installs one), never at a
+;;;   login. Kept as an HTTP-PROTOCOL:SECRET inside the app; sent only in the
+;;;   exchange's Set-Cookie. rpc-backend-htmx depends on secrets-protocol, not
+;;;   on a backend: the application picks it, as for every stack protocol.
+;;; TOKEN-NAME (default +DEFAULT-TOKEN-NAME+, "canvas-token") — the cookie's
+;;;   name and the one-time URL's query field: a non-empty string of
+;;;   [A-Za-z0-9_-], else TYPE-ERROR. Cookies are not isolated by port (RFC
+;;;   6265 §8.5): two gated apps on one host (two runs on 127.0.0.1) need
+;;;   distinct names, or the second login replaces the first run's cookie.
+;;; (HTMX-TOKEN-URL url token &key (token-name +default-token-name+)) → URL plus
+;;;   the field "<token-name>=<token>" ("?" first when URL has no "?", else
+;;;   "&"): the one-time URL to open in a browser. URL a string without "#";
+;;;   TOKEN and TOKEN-NAME as above; else TYPE-ERROR.
+;;; With a token in force every request the app gets is gated FIRST: an
+;;; unauthenticated request never has its body read, its params decoded, a
+;;; handler or an asset served (403, not 404 / 405 / 413). Reading the request:
+;;;   query fields — ENV :QUERY-STRING split raw by quri
+;;;     (URL-DECODE-PARAMS :lenient t :percent-decode nil);
+;;;   cookies — the "cookie" request header split the same way with
+;;;     :delimiter #\;, names trimmed of spaces and tabs;
+;;;   values compared raw (no percent-decoding) and in constant time: one
+;;;     internal function, %TOKEN= (presented secret), which is
+;;;     SECRETS-PROTOCOL:CONSTANT-TIME-EQUAL on the UTF-8 octets of both.
+;;;   The cookie is VALID when some cookie named TOKEN-NAME has the SESSION
+;;;   secret as its value. A cookie holding TOKEN is not valid.
+;;; 1. The query has a field named TOKEN-NAME (exactly, raw) — the exchange:
+;;;    a. exactly one such field, its value is TOKEN, and this app's bootstrap
+;;;       token is unused → mark it used and answer 303, no body, with
+;;;       headers, in this order:
+;;;         :location L   :set-cookie C   :cache-control "no-store"
+;;;       C is exactly
+;;;         <TOKEN-NAME>=<SESSION>; Path=/; HttpOnly; SameSite=Strict
+;;;       followed by "; Secure" when ENV :URL-SCHEME is "https" (any case), and
+;;;       never otherwise: a loopback bind is plain http, where a Secure cookie
+;;;       is not stored. No Domain (host-only), no Max-Age / Expires (a session
+;;;       cookie; the secret dies with the run). Path=/ covers the method prefix
+;;;       and the asset prefix alike. HttpOnly: no script reads it; SameSite=
+;;;       Strict: no other site's page sends it (cross-site request forgery).
+;;;    b. anything else → 403 (HTMX-FORBIDDEN): a used bootstrap token, a
+;;;       wrong one, the session secret presented as one, the field twice —
+;;;       even when the request also carries a valid cookie. A request that
+;;;       fails here does not use the bootstrap token.
+;;;    L, the clean URL, is the path of ENV :REQUEST-URI (all before "?") and,
+;;;    when other fields remain, "?" and those fields raw, in order, each
+;;;    "name=value" ("name" alone for a field without "="), joined by "&": the
+;;;    token never stays in the address bar or reaches the handler. When that
+;;;    path does not start with "/", starts with "//" or "/\", or holds a
+;;;    control character or a space → 403 instead of a, so the redirect can
+;;;    never leave the origin.
+;;; 2. Otherwise: the cookie is valid → the request goes on (step 2 of HTMX-APP);
+;;;    else → 403 (HTMX-FORBIDDEN).
+;;; The 403 is (HTMX-ERROR-RESPONSE transport condition): the error fragment
+;;; with status 403, so a browser shows it in the error target. It never
+;;; echoes a value the request sent.
+;;; State is per app: each HTMX-APP call has its own session secret and its
+;;; own bootstrap use (one transport can back several apps, each with one
+;;; exchange; a cookie from one app is not valid on another). The use is
+;;; marked under a lock (bordeaux-threads): of concurrent valid exchanges
+;;; exactly one gets 1a.
+;;; Threat model: a leaked one-time URL is worthless once used (the exchange
+;;; consumed it, and it was never the cookie); a leaked unused one gives one
+;;; session, so open it at once. The session secret stays in the browser's
+;;; HttpOnly cookie jar. JSONRPC-HANDLER is not gated: the JSON-RPC server it
+;;; runs in authenticates its own clients.
 ;;;
 ;;; JSONRPC-HANDLER (transport handlers) → (lambda (method params) → string), for
 ;;;   any JSON-RPC server (rpc-backend-http MAKE-RPC-APP, …). Same table, same
@@ -93,6 +222,17 @@
 ;;;   (<name> the JSON key as sent). A string stays a string, so a handler's
 ;;;   COERCE-PARAM :file refuses it ("<field> must be a file"). Uploads go
 ;;;   through the htmx multipart route.
+;;;   Keys (0.3.0, #2 #3), in this order: (1) the PARAMS shape, as above;
+;;;   (2) more members than the codec's MAX-PARAMS (the transport's) →
+;;;   HTMX-TOO-MANY-PARAMS; (3) each member in sorted name order, empty names
+;;;   dropped, its value checked as above; (4) the method: unknown or a
+;;;   :call-stream entry → RPC-METHOD-NOT-FOUND; (5) names map to keywords as
+;;;   the codec maps them (FIND-SYMBOL, never INTERN; unmapped names kept
+;;;   apart) and the entry's key set accepts them (handlers.lisp, Accepting a
+;;;   request): refused → HTMX-UNKNOWN-PARAM (code -32602, message
+;;;   "Unknown param <name>"). The call is (apply fn plist), no
+;;;   :allow-other-keys, so a canvas with no parameters answers over JSON-RPC
+;;;   too. *HTMX-REQUEST*'s message has those params and unmapped names.
 
 (defparameter +stream-error-event+ "canvas-error"
   "SSE event name for an error after a stream opened.")
@@ -100,21 +240,111 @@
 (defvar *htmx-request* nil
   "The HTMX-MESSAGE being handled, bound while a handler runs.")
 
+(defparameter +default-csp+
+  "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'"
+  "The canvas brief's Content-Security-Policy (cl-stack docs/capabilities/canvas.md
+§ H4h-2), exactly: what :CSP T sends.")
+
+(defparameter +default-token-name+ "canvas-token"
+  "Default cookie name and one-time URL field of the token gate.")
+
 (defclass htmx-transport (rpc-protocol:rpc-transport)
   ((codec :initarg :codec :reader htmx-transport-codec)
    (error-target :initarg :error-target :initform +error-fragment-target+
                  :reader htmx-transport-error-target)
    (error-swap :initarg :error-swap :initform +error-fragment-swap+
-               :reader htmx-transport-error-swap))
-  (:documentation "htmx server transport: an HTMX-CODEC plus error-fragment placement."))
+               :reader htmx-transport-error-swap)
+   (csp :initarg :csp :initform nil :reader htmx-transport-csp
+        :documentation "NIL or the Content-Security-Policy string (0.3.0, #4).")
+   (token :initarg :token :initform nil :reader htmx-transport-token
+          :documentation "NIL or the per-run token as an HTTP-PROTOCOL:SECRET (0.3.0, #4).")
+   (token-name :initarg :token-name :initform +default-token-name+
+               :reader htmx-transport-token-name
+               :documentation "Cookie name and one-time URL field of the token gate."))
+  (:documentation "htmx server transport: an HTMX-CODEC, error-fragment placement, and
+the app's CSP and token gate. See the file header."))
+
+;;; Option validation (0.3.0). Each returns the value to store or signals
+;;; TYPE-ERROR (CHECK-TYPE, so STORE-VALUE is offered). File header,
+;;; Content-Security-Policy and Token gate. The character classes are ASCII
+;;; ranges on purpose: ALPHANUMERICP is true for "é".
+
+(defun %token-char-p (char)
+  "True for a character of [A-Za-z0-9_-]."
+  (or (char<= #\a char #\z) (char<= #\A char #\Z) (char<= #\0 char #\9)
+      (char= char #\_) (char= char #\-)))
+
+(defun %policy-string-p (object)
+  "True for a non-empty string holding no control character (code below 32, or 127)."
+  (and (stringp object) (plusp (length object))
+       (notany #'%file-control-char-p object)))
+
+(defun %token-string-p (object)
+  "True for a string, or an HTTP-PROTOCOL:SECRET wrapping one, of 32 to 512
+characters of [A-Za-z0-9_-]."
+  (let ((value (http-protocol:reveal object)))
+    (and (stringp value) (<= 32 (length value) 512)
+         (every #'%token-char-p value))))
+
+(defun %token-name-p (object)
+  "True for a non-empty string of [A-Za-z0-9_-]."
+  (and (stringp object) (plusp (length object))
+       (every #'%token-char-p object)))
+
+(defun %url-without-fragment-p (object)
+  "True for a string holding no #."
+  (and (stringp object) (not (find #\# object))))
+
+(defun %csp-option (csp)
+  "CSP (NIL, T or a policy string) → NIL or the policy string; else TYPE-ERROR."
+  (check-type csp (or null (eql t) (satisfies %policy-string-p))
+              "NIL, T or a non-empty policy string with no control character")
+  (if (eq csp t) +default-csp+ csp))
+
+(defun %token-option (token)
+  "TOKEN (NIL, a string or an HTTP-PROTOCOL:SECRET) → NIL or a SECRET; else TYPE-ERROR."
+  ;; The datum of the TYPE-ERROR is what the caller passed: a SECRET prints redacted.
+  (check-type token (or null (satisfies %token-string-p))
+              "NIL, or a string or SECRET of 32 to 512 characters of [A-Za-z0-9_-]")
+  (http-protocol:make-secret token))   ; NIL stays NIL, a SECRET comes back unchanged
+
+(defun %token-name-option (token-name)
+  "TOKEN-NAME → itself when it is a non-empty string of [A-Za-z0-9_-]; else TYPE-ERROR."
+  (check-type token-name (satisfies %token-name-p) "a non-empty string of [A-Za-z0-9_-]")
+  token-name)
+
+(defun %transport-csp (csp)
+  "0.3.0 contract: NIL and T need no validation; anything else goes to %CSP-OPTION."
+  (cond ((null csp) nil)
+        ((eq csp t) +default-csp+)
+        (t (%csp-option csp))))
 
 (defun make-htmx-transport (&key (prefix "/") (max-body-bytes +default-max-body-bytes+)
+                              (max-params +default-max-params+)
                               (error-target +error-fragment-target+)
-                              (error-swap +error-fragment-swap+))
+                              (error-swap +error-fragment-swap+)
+                              csp token (token-name +default-token-name+))
+  "An HTMX-TRANSPORT. See the file header (MAKE-HTMX-TRANSPORT)."
   (make-instance 'htmx-transport
-                 :codec (make-htmx-codec :prefix prefix :max-body-bytes max-body-bytes)
+                 :codec (make-htmx-codec :prefix prefix :max-body-bytes max-body-bytes
+                                         :max-params max-params)
                  :error-target error-target
-                 :error-swap error-swap))
+                 :error-swap error-swap
+                 :csp (%transport-csp csp)
+                 :token (and token (%token-option token))
+                 :token-name (if (equal token-name +default-token-name+)
+                                 token-name
+                                 (%token-name-option token-name))))
+
+(defun htmx-token-url (url token &key (token-name +default-token-name+))
+  "URL with \"<token-name>=<token>\" appended: the one-time URL of the token gate.
+See the file header (Token gate)."
+  (check-type url (satisfies %url-without-fragment-p) "a URL string with no #")
+  (check-type token (satisfies %token-string-p)
+              "a string or SECRET of 32 to 512 characters of [A-Za-z0-9_-]")
+  (check-type token-name (satisfies %token-name-p) "a non-empty string of [A-Za-z0-9_-]")
+  (concatenate 'string url (if (find #\? url) "&" "?")
+               token-name "=" (http-protocol:reveal token)))
 
 (defun htmx-transport-prefix (transport)
   "The codec prefix."
@@ -135,13 +365,171 @@
 (defgeneric htmx-error-response (transport condition)
   (:documentation "Clack response for CONDITION (status + error fragment + HX headers)."))
 
-(defun htmx-app (transport handler &key stream-handler)
-  "Clack app serving HANDLER / STREAM-HANDLER through TRANSPORT."
+;;; App wrapping (0.3.0). File header, HTMX-APP, Content-Security-Policy and
+;;; Token gate. HTMX-APP composes three layers once, leaving out a layer that
+;;; is off: CSP outermost (so the gate's 303 / 403 carry it too), then the
+;;; gate, then HTMX-HANDLE-REQUEST. With neither in force the app is 0.2.1's
+;;; closure itself.
+
+(defstruct (%gate (:constructor %make-gate (session)) (:copier nil) (:predicate nil))
+  ;; One app's token gate state (file header, Token gate: state is per app).
+  (session nil :read-only t)            ; this app's session secret, an HTTP-PROTOCOL:SECRET
+  (used nil)                            ; T once the bootstrap token was exchanged
+  (lock (bt:make-lock "rpc-backend-htmx token gate") :read-only t))
+
+(defun %token= (presented secret)
+  "True when the string PRESENTED is SECRET (a string): SECRETS-PROTOCOL:
+CONSTANT-TIME-EQUAL on their UTF-8 octets."
+  (and (stringp presented)
+       (stringp secret)
+       (handler-case (secrets-protocol:constant-time-equal (%utf8-octets presented)
+                                                           (%utf8-octets secret))
+         ;; Translate only: a presented value that does not encode is not the
+         ;; secret, so the request is refused (403), not failed (500).
+         (stack-encoding:encoding-error () nil))))
+
+(defun %raw-fields (string delimiter)
+  "STRING split by quri into ((name . value) …), raw (no percent-decoding; a
+field without = has the value NIL); () for NIL or \"\"."
+  (if (and (stringp string) (plusp (length string)))
+      (quri:url-decode-params string :delimiter delimiter :lenient t :percent-decode nil)
+      '()))
+
+(defun %location-path-p (path)
+  "True for a path the exchange may redirect to: it starts with / but not with
+// or /\\, and holds no space and no control character (file header, Token gate)."
+  (and (plusp (length path))
+       (char= #\/ (char path 0))
+       (not (and (> (length path) 1) (find (char path 1) "/\\")))
+       (notany (lambda (char) (or (char= char #\Space) (%file-control-char-p char))) path)))
+
+(defun %clean-location (env token-name fields)
+  "The exchange's Location: the path of ENV :REQUEST-URI and the query FIELDS
+other than TOKEN-NAME, raw and in order. NIL when the path could leave the
+origin, or (defence in depth for the Location header) when the URL would hold a
+control character."
+  (let* ((uri (getf env :request-uri))
+         (path (if (stringp uri) (subseq uri 0 (or (position #\? uri) (length uri))) ""))
+         (rest (loop for (name . value) in fields
+                     unless (string= name token-name)
+                       collect (if value (concatenate 'string name "=" value) name)))
+         (location (format nil "~A~@[?~{~A~^&~}~]" path rest)))
+    (and (%location-path-p path)
+         (notany #'%file-control-char-p location)
+         location)))
+
+(defun %session-cookie (token-name gate env)
+  "The exchange's Set-Cookie value: the session secret, host-only, for the run."
+  (let ((scheme (getf env :url-scheme)))
+    (format nil "~A=~A; Path=/; HttpOnly; SameSite=Strict~:[~;; Secure~]"
+            token-name (http-protocol:reveal (%gate-session gate))
+            (and scheme (typep scheme '(or string symbol)) (string-equal scheme "https")))))
+
+(defun %use-bootstrap (gate)
+  "Mark GATE's bootstrap token used, under its lock. → T for the one call that
+did, NIL when it was already used."
+  (bt:with-lock-held ((%gate-lock gate))
+    (if (%gate-used gate)
+        nil
+        (setf (%gate-used gate) t))))
+
+(defun %valid-cookie-p (token-name gate env)
+  "True when some cookie named TOKEN-NAME holds GATE's session secret."
+  (let ((session (http-protocol:reveal (%gate-session gate))))
+    (loop for (name . value) in (%raw-fields (%env-header env "cookie") #\;)
+            thereis (and (string= token-name (string-trim '(#\Space #\Tab) name))
+                         (%token= value session)))))
+
+(defun %forbidden (transport)
+  "The gate's 403: the error fragment of HTMX-FORBIDDEN, echoing nothing."
+  (htmx-error-response transport (make-condition 'htmx-forbidden)))
+
+(defun %token-gate (transport token token-name state env)
+  "NIL when ENV may go on to HTMX-HANDLE-REQUEST, else the gate's response (a
+303 or a 403). TOKEN the bootstrap SECRET; STATE this app's session secret and
+bootstrap use (file header, Token gate)."
+  (let* ((fields (%raw-fields (getf env :query-string) #\&))
+         (count (count token-name fields :key #'car :test #'string=)))
+    (cond ((plusp count)
+           ;; 1. The exchange; a valid cookie never rescues a failed one.
+           (let ((location (%clean-location env token-name fields)))
+             (if (and (= count 1)
+                      (%token= (cdr (assoc token-name fields :test #'string=))
+                               (http-protocol:reveal token))
+                      location
+                      ;; Last: only an exchange that passed everything else uses the token.
+                      (%use-bootstrap state))
+                 (list 303
+                       (list :location location
+                             :set-cookie (%session-cookie token-name state env)
+                             :cache-control "no-store")
+                       '())
+                 (%forbidden transport))))
+          ;; 2. Otherwise the session cookie.
+          ((%valid-cookie-p token-name state env) nil)
+          (t (%forbidden transport)))))
+
+(defun %with-csp (response csp)
+  "RESPONSE (a list or a Clack streaming function) with
+(:content-security-policy CSP) as its last header; RESPONSE itself when CSP is NIL."
+  ;; Never destructive: a response may be a literal (sse-backend-clack's 404),
+  ;; so the header list is copied by APPEND and the body is shared as it is.
+  (flet ((add (reply)
+           (list* (first reply)
+                  (append (second reply) (list :content-security-policy csp))
+                  (cddr reply))))
+    (cond ((null csp) response)
+          ((functionp response)
+           ;; Clack streaming: the (status headers) handed to the responder.
+           (lambda (responder)
+             (funcall response (lambda (reply) (funcall responder (add reply))))))
+          ((consp response) (add response))
+          (t response))))
+
+(defun %handler-app (transport handler stream-handler)
+  "The innermost layer: 0.2.1's app."
+  (lambda (env)
+    (htmx-handle-request transport handler stream-handler env)))
+
+(declaim (notinline %gate-response))
+
+(defun %gate-layer (app transport token token-name)
+  "APP behind the token gate when TOKEN is in force, else APP itself. Each call
+makes its own state: a session secret from the CSPRNG (no secrets backend →
+SECRETS-PROTOCOL:SECRETS-ERROR here, not at a login) and an unused bootstrap."
+  (if (null token)
+      app
+      (let ((state (%make-gate (http-protocol:make-secret (secrets-protocol:token-urlsafe 32)))))
+        (lambda (env)
+          (or (%gate-response transport token token-name state env)
+              (funcall app env))))))
+
+(defun %csp-layer (app csp)
+  "APP with CSP added to every response when a policy is in force, else APP itself."
+  (if (null csp)
+      app
+      (lambda (env)
+        (%with-csp (funcall app env) csp))))
+
+(defun htmx-app (transport handler &key stream-handler
+                                     (csp nil csp-p) (token nil token-p)
+                                     (token-name nil token-name-p))
+  "Clack app serving HANDLER / STREAM-HANDLER through TRANSPORT, with its CSP and
+token gate (CSP, TOKEN, TOKEN-NAME override the transport's when supplied). See
+the file header."
   (check-type transport htmx-transport)
   (check-type handler (or htmx-handlers function null))
   (check-type stream-handler (or function null))
-  (lambda (env)
-    (htmx-handle-request transport handler stream-handler env)))
+  (let ((policy (if csp-p (%transport-csp csp) (htmx-transport-csp transport)))
+        (bootstrap (if token-p
+                       (and token (%token-option token))
+                       (htmx-transport-token transport)))
+        (name (if token-name-p
+                  (%token-name-option token-name)
+                  (htmx-transport-token-name transport))))
+    (%csp-layer (%gate-layer (%handler-app transport handler stream-handler)
+                             transport bootstrap name)
+                policy)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Condition boundaries
@@ -185,10 +573,26 @@ environment (*HTMX-REQUEST*, a transport's specials), then unwinds."
                                  (return-from ,boundary (%safe-error-response ,tx c)))))
            ,@body)))))
 
+;;; The gate under the request boundary, in its own NOTINLINE function (declaimed
+;;; above %GATE-LAYER): the boundary's value is RETURNED, and the caller's OR
+;;; tests a plain value. Written inline, (or (block … (handler-bind …)) …) is
+;;; the shape ECL 26.5.5 miscompiles (%RUN-CAPTURING-ERROR below), which would
+;;; let a failing gate fall through to the handler.
+(defun %gate-response (transport token token-name state env)
+  "%TOKEN-GATE's answer; an ERROR inside it → an error response, never NIL, so
+the gate fails closed. Nothing escapes the app."
+  (%with-error-response (transport)
+    (%token-gate transport token token-name state env)))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Request flow
 ;;; ---------------------------------------------------------------------------
 
+;;; A table entry: 404, then 406, then its key set (%ENTRY-KEY-SET, derived
+;;; again after a redefinition) accepts the message's params and unmapped names
+;;; (%ACCEPT-PARAMS), all before the thunk is made, so a refused :call-stream
+;;; request is a plain 400 and no stream opens. The thunk calls (apply fn
+;;; params) / (apply fn stream params), never with :allow-other-keys (#3).
 (defun %resolve-callee (handler stream-handler message)
   "→ (values thunk mode). THUNK takes no argument (:call-response, :notify) or
 the event stream (:call-stream) and applies the callee's calling convention."
@@ -197,15 +601,16 @@ the event stream (:call-stream) and applies the callee's calling convention."
         (streamp (eq (htmx-message-mode message) :call-stream)))
     (etypecase handler
       (htmx-handlers
-       (multiple-value-bind (fn mode) (find-htmx-handler handler name)
-         (cond ((null fn) (%method-not-found name))
-               ((and (eq mode :call-stream) (not streamp))
-                (error 'htmx-not-acceptable))
-               ((eq mode :call-stream)
-                (values (lambda (stream) (apply fn stream :allow-other-keys t params))
-                        mode))
-               (t
-                (values (lambda () (apply fn :allow-other-keys t params)) mode)))))
+       (let ((entry (%find-entry handler name)))
+         (unless entry (%method-not-found name))
+         (let ((fn (%entry-callee entry))
+               (mode (%entry-mode entry)))
+           (when (and (eq mode :call-stream) (not streamp))
+             (error 'htmx-not-acceptable))
+           (%accept-params (%entry-key-set entry) params (htmx-message-unmapped-names message))
+           (if (eq mode :call-stream)
+               (values (lambda (stream) (apply fn stream params)) mode)
+               (values (lambda () (apply fn params)) mode)))))
       ((or function null)
        (let ((fn (if streamp stream-handler handler)))
          (unless fn (%method-not-found name))
@@ -423,20 +828,27 @@ JSON-RPC form (file header)."
               :message (format nil "Param ~A must be a string or an integer; JSON-RPC carries no file params"
                                key)))))
 
-(defun %json-params-plist (params)
-  "JSON-RPC PARAMS (NIL, an empty vector or an object) → keyword plist, keys sorted."
+;;; JSONRPC-HANDLER follows the header's Keys order: %JSON-PAIRS does (1) the
+;;; shape, (2) the member cap and (3) the sorted, checked members; then (4) the
+;;; method; then (5) the names through the codec's own %PARAMS-PLIST
+;;; (FIND-SYMBOL, unmapped names kept apart) and the entry's key set.
+(defun %json-pairs (params limit)
+  "JSON-RPC PARAMS (NIL, an empty vector or an object) → ((name . string) …) in
+sorted name order, empty names dropped; more than LIMIT members →
+HTMX-TOO-MANY-PARAMS. File header, JSONRPC-HANDLER, Keys (1)–(3)."
   (cond ((null params) '())
         ((and (vectorp params) (not (stringp params)) (zerop (length params))) '())
         ((hash-table-p params)
-         (let ((keys '()))
-           (maphash (lambda (k v) (declare (ignore v)) (push k keys)) params)
-           (unless (every #'stringp keys)
+         (let ((names '()))
+           (maphash (lambda (k v) (declare (ignore v)) (push k names)) params)
+           (unless (every #'stringp names)
              (error 'rpc-protocol:rpc-invalid-params :message "Param names must be strings"))
+           (when (> (hash-table-count params) limit)
+             (error 'htmx-too-many-params :limit limit))
            ;; Sorted: hash-table order never reaches the handler.
-           (loop for key in (sort keys #'string<)
-                 unless (zerop (length key))
-                   collect (intern (string-upcase key) :keyword)
-                   and collect (%json-param-value key (gethash key params)))))
+           (loop for name in (sort names #'string<)
+                 unless (zerop (length name))
+                   collect (cons name (%json-param-value name (gethash name params))))))
         (t (error 'rpc-protocol:rpc-invalid-params
                   :message "Params must be an object of strings or integers"))))
 
@@ -444,19 +856,23 @@ JSON-RPC form (file header)."
   "JSON-RPC handler over the same HANDLERS table. See the file header."
   (check-type transport htmx-transport)
   (check-type handlers htmx-handlers)
-  (lambda (method params)
-    (let ((plist (%json-params-plist params)))
-      (multiple-value-bind (fn mode) (find-htmx-handler handlers method)
-        (when (or (null fn) (eq mode :call-stream))
+  (let ((limit (htmx-codec-max-params (htmx-transport-codec transport))))
+    (lambda (method params)
+      (let* ((pairs (%json-pairs params limit))
+             (entry (%find-entry handlers method)))
+        (when (or (null entry) (eq (%entry-mode entry) :call-stream))
           (%method-not-found method))
-        (let ((*htmx-request* (make-instance 'htmx-message :method method :params plist
-                                                           :mode :call-response
-                                                           :http-method :post)))
-          (multiple-value-bind (result headers) (apply fn :allow-other-keys t plist)
-            (if (eq mode :notify)
-                ""
-                (format nil "~{~A~}"
-                        (third (rpc-protocol:encode-response-using-codec
-                                (htmx-transport-codec transport)
-                                (htmx-result-nodes transport result)
-                                :headers headers))))))))))
+        (multiple-value-bind (plist unmapped) (%params-plist pairs)
+          (%accept-params (%entry-key-set entry) plist unmapped)
+          (let ((*htmx-request* (make-instance 'htmx-message :method method :params plist
+                                                             :unmapped-names unmapped
+                                                             :mode :call-response
+                                                             :http-method :post)))
+            (multiple-value-bind (result headers) (apply (%entry-callee entry) plist)
+              (if (eq (%entry-mode entry) :notify)
+                  ""
+                  (format nil "~{~A~}"
+                          (third (rpc-protocol:encode-response-using-codec
+                                  (htmx-transport-codec transport)
+                                  (htmx-result-nodes transport result)
+                                  :headers headers)))))))))))

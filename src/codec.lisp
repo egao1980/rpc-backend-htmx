@@ -18,8 +18,27 @@
 ;;;   multipart, encoding-protocol for UTF-8. No private parsers.
 ;;;   An empty POST body needs no content type; a non-empty body of any other
 ;;;   type → HTMX-UNSUPPORTED-MEDIA-TYPE. Malformed input → HTMX-BAD-REQUEST.
-;;;   Result: a plist keyword → value. Key = (intern (string-upcase name) :keyword);
-;;;   empty names dropped; first-occurrence order (of any kind of value).
+;;;   Result: a plist keyword → value. Empty names dropped; first-occurrence
+;;;   order (of any kind of value). Names become keys WITHOUT interning (0.3.0,
+;;;   rpc-backend-htmx#2; 0.2.1 interned every name, so any client could grow
+;;;   the KEYWORD package without bound):
+;;;     key = the symbol (FIND-SYMBOL (STRING-UPCASE name) :KEYWORD) finds,
+;;;           when its second value is non-NIL;
+;;;     no such keyword → the name is UNMAPPED: not in the params, listed in
+;;;           HTMX-MESSAGE-UNMAPPED-NAMES — each upcased name once, under its
+;;;           first spelling, in wire order (a fresh list of strings).
+;;;   Nothing a request sends is ever interned (no INTERN, no reader). Every
+;;;   keyword a handler can take already exists — its lambda list or :PARAMS
+;;;   made it (handlers.lisp, Key sets) — so an unmapped name is one no handler
+;;;   takes; the server refuses it or drops it by the handler's key set.
+;;;   Field cap (0.3.0, #2): at most MAX-PARAMS (codec option, default
+;;;   +DEFAULT-MAX-PARAMS+ = 1000) fields that carry a value — query and
+;;;   urlencoded fields with a non-empty name, multipart parts with a
+;;;   non-empty name other than empty file inputs — counted together over the
+;;;   query and the body, duplicates and unmapped names included. More →
+;;;   HTMX-TOO-MANY-PARAMS (413, :limit MAX-PARAMS), before any name is
+;;;   mapped. 413 like HTMX-BODY-TOO-LARGE: the request is well formed, only
+;;;   bigger than the server takes (400 stays "malformed").
 ;;;   Values:
 ;;;   - text (a query field, a urlencoded field, a multipart part without a
 ;;;     filename): a string; a later text duplicate (query then body) replaces
@@ -160,6 +179,9 @@
 (defconstant +default-max-body-bytes+ 1048576
   "Default request body limit (1 MiB).")
 
+(defconstant +default-max-params+ 1000
+  "Default limit on the fields of one request (0.3.0, #2): codec.lisp header, Params.")
+
 (defparameter +request-metadata-headers+
   '(("hx-request" . :request)
     ("hx-target" . :target)
@@ -179,14 +201,21 @@
   ((prefix :initarg :prefix :initform "/" :reader htmx-codec-prefix
            :documentation "Mount prefix; method names follow it in the path. Ends with /.")
    (max-body-bytes :initarg :max-body-bytes :initform +default-max-body-bytes+
-                   :reader htmx-codec-max-body-bytes))
+                   :reader htmx-codec-max-body-bytes)
+   (max-params :initarg :max-params :initform +default-max-params+
+               :reader htmx-codec-max-params
+               :documentation "Most fields one request may carry (0.3.0, #2)."))
   (:documentation "htmx requests ↔ rpc messages; fragments ↔ responses."))
 
-(defun make-htmx-codec (&key (prefix "/") (max-body-bytes +default-max-body-bytes+))
-  "PREFIX a string starting and ending with /; MAX-BODY-BYTES a non-negative integer."
+(defun make-htmx-codec (&key (prefix "/") (max-body-bytes +default-max-body-bytes+)
+                          (max-params +default-max-params+))
+  "PREFIX a string starting and ending with /; MAX-BODY-BYTES and MAX-PARAMS
+non-negative integers (else TYPE-ERROR)."
   (check-type prefix (and string (satisfies %slash-bounded-p)))
   (check-type max-body-bytes (integer 0))
-  (make-instance 'htmx-codec :prefix prefix :max-body-bytes max-body-bytes))
+  (check-type max-params (integer 0))
+  (make-instance 'htmx-codec :prefix prefix :max-body-bytes max-body-bytes
+                             :max-params max-params))
 
 (defun %slash-bounded-p (string)
   "True for a non-empty string that starts and ends with /."
@@ -200,6 +229,10 @@
    (params :initarg :params :initform nil :reader htmx-message-params
            :documentation "Plist keyword → string, STACK-MIME:MIME-ENTITY (a file part)
 or a list of entities (several files under one name). See the file header.")
+   (unmapped-names :initarg :unmapped-names :initform nil
+                   :reader htmx-message-unmapped-names
+                   :documentation "Param names that named no keyword (0.3.0, #2), as sent,
+in wire order. See the file header (Params).")
    (metadata :initarg :metadata :initform nil :reader htmx-message-metadata
              :documentation "Plist, see +REQUEST-METADATA-HEADERS+.")
    (mode :initarg :mode :initform :call-response :reader htmx-message-mode
@@ -359,20 +392,57 @@ the parsed MEDIA-TYPE, never copied from the request."
                (%multipart-pairs media-type body))
               (t (error 'htmx-unsupported-media-type :content-type content-type)))))))
 
-(defun %file-params-plist (pairs)
-  "%PARAMS-PLIST for PAIRS that hold file parts: keys in first-occurrence
-order; text values as in 0.1; a name with file parts takes only those (one →
-the entity, several → a fresh list in part order). See the file header."
+;;; Names → keys (0.3.0, rpc-backend-htmx#2): %NAME-KEY (FIND-SYMBOL, never
+;;; INTERN) is the one mapping site, %KEY-PAIRS the one pass over the pairs;
+;;; JSONRPC-HANDLER goes through the same %PARAMS-PLIST. %CHECK-PARAM-COUNT runs
+;;; on all the pairs (query then body) before any name is mapped. File header,
+;;; Params.
+
+(defun %name-key (name)
+  "The keyword the param NAME maps to, or NIL when NAME is unmapped.
+Never interns (FIND-SYMBOL in KEYWORD). See the file header (Params)."
+  (multiple-value-bind (symbol status) (find-symbol (string-upcase name) :keyword)
+    (and status symbol)))
+
+(defun %check-param-count (pairs limit)
+  "Signal HTMX-TOO-MANY-PARAMS (:limit LIMIT) when PAIRS — the value-carrying
+fields of one request, query then body — are more than LIMIT."
+  (when (> (length pairs) limit)
+    (error 'htmx-too-many-params :limit limit))
+  (values))
+
+(defun %key-pairs (pairs)
+  "PAIRS ((name . value) …) in wire order → (values KEYED UNMAPPED): KEYED the
+fresh ((keyword . value) …) of the names %NAME-KEY maps, in order; UNMAPPED the
+other names, each upcased name once under its first spelling, in wire order (a
+fresh list)."
+  (let ((seen (make-hash-table :test 'equal)) ; lookup only, never iterated
+        (keyed '())
+        (unmapped '()))
+    (loop for (name . value) in pairs
+          for key = (%name-key name)
+          do (if key
+                 (push (cons key value) keyed)
+                 (let ((upcased (string-upcase name)))
+                   (unless (gethash upcased seen)
+                     (setf (gethash upcased seen) t)
+                     (push name unmapped)))))
+    (values (nreverse keyed) (nreverse unmapped))))
+
+(defun %file-params-plist (keyed)
+  "%PARAMS-PLIST for KEYED pairs ((keyword . value) …) that hold file parts:
+keys in first-occurrence order; text values as in 0.1; a key with file parts
+takes only those (one → the entity, several → a fresh list in part order). See
+the file header."
   (let ((cells (make-hash-table :test 'eq)) ; lookup only, never iterated
         (out '()))
     ;; A cell is (KEY TEXT FILES): TEXT the last text value (a string) or NIL,
     ;; FILES the entities under KEY, newest first.
-    (loop for (name . value) in pairs
-          do (let* ((key (intern (string-upcase name) :keyword))
-                    (cell (or (gethash key cells)
-                              (let ((new (list key nil '())))
-                                (push new out)
-                                (setf (gethash key cells) new)))))
+    (loop for (key . value) in keyed
+          do (let ((cell (or (gethash key cells)
+                             (let ((new (list key nil '())))
+                               (push new out)
+                               (setf (gethash key cells) new)))))
                (if (stack-mime:mime-entity-p value)
                    (push value (third cell))
                    (setf (second cell) value))))
@@ -382,16 +452,12 @@ the entity, several → a fresh list in part order). See the file header."
                         ((null (rest files)) (first files))
                         (t (reverse files))))))
 
-(defun %params-plist (pairs)
-  "PAIRS in wire order → keyword plist; first-occurrence order, later
-duplicates replace the value in place. Values stay strings.
-0.2.0: PAIRS holding a file part go to %FILE-PARAMS-PLIST."
-  (when (some (lambda (pair) (stack-mime:mime-entity-p (cdr pair))) pairs)
-    (return-from %params-plist (%file-params-plist pairs)))
+(defun %text-params-plist (keyed)
+  "KEYED pairs ((keyword . string) …) → plist; first-occurrence order, later
+duplicates replace the value in place."
   (let ((cells (make-hash-table :test 'eq)) ; lookup only, never iterated
         (out '()))
-    (loop for (name . value) in pairs
-          for key = (intern (string-upcase name) :keyword)
+    (loop for (key . value) in keyed
           for cell = (gethash key cells)
           do (if cell
                  (setf (cdr cell) value)
@@ -399,6 +465,17 @@ duplicates replace the value in place. Values stay strings.
                    (setf (gethash key cells) new)
                    (push new out))))
     (loop for (key . value) in (nreverse out) collect key collect value)))
+
+(defun %params-plist (pairs)
+  "PAIRS ((name . value) …) in wire order → (values PLIST UNMAPPED): PLIST
+keyword → value in first-occurrence order (text duplicates replace the value in
+place; 0.2.0 file parts as %FILE-PARAMS-PLIST), UNMAPPED the names that named no
+keyword (%KEY-PAIRS). Nothing is interned. See the file header (Params)."
+  (multiple-value-bind (keyed unmapped) (%key-pairs pairs)
+    (values (if (some (lambda (pair) (stack-mime:mime-entity-p (cdr pair))) keyed)
+                (%file-params-plist keyed)
+                (%text-params-plist keyed))
+            unmapped)))
 
 (defun %request-metadata (env)
   (loop for (header . key) in +request-metadata-headers+
@@ -431,12 +508,17 @@ duplicates replace the value in place. Values stay strings.
           (let ((body (%read-request-body env (htmx-codec-max-body-bytes codec))))
             (when (plusp (length body))
               (setf pairs (append pairs (%body-pairs env body))))))
-        (make-instance 'htmx-message
-                       :method rest
-                       :params (%params-plist pairs)
-                       :metadata (%request-metadata env)
-                       :mode (%request-mode env)
-                       :http-method http-method)))))
+        ;; The field cap first, on every pair (query then body), before any
+        ;; name is mapped; then the names, never interned (file header, Params).
+        (%check-param-count pairs (htmx-codec-max-params codec))
+        (multiple-value-bind (params unmapped) (%params-plist pairs)
+          (make-instance 'htmx-message
+                         :method rest
+                         :params params
+                         :unmapped-names unmapped
+                         :metadata (%request-metadata env)
+                         :mode (%request-mode env)
+                         :http-method http-method))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Requests (client side)

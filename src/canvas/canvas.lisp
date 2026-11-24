@@ -58,6 +58,24 @@
 ;;;   streams and error responses never carry a script, whatever PAGE-KEYS is.
 ;;;   The asset route already serves canvas-keys.js (CANVAS:ASSET-NAMES).
 ;;;
+;;; Security (0.3.0, rpc-backend-htmx#4). MAKE-CANVAS-HTMX-TRANSPORT &key …
+;;; max-params (csp t) token (token-name +default-token-name+): the core
+;;; transport's options (server.lisp, MAKE-HTMX-TRANSPORT, Content-Security-
+;;; Policy, Token gate; codec.lisp, Params), validated the same way, with one
+;;; difference: CSP defaults to T, the brief's policy (+DEFAULT-CSP+), here.
+;;; Why on by default: canvas output is CSP-clean by construction —
+;;; canvas-protocol's EL refuses script / iframe / object / embed and on* /
+;;; hx-on* attributes, no component writes a style attribute or inline
+;;; script, and PAGE loads htmx, its SSE extension, canvas-keys.js and the
+;;; stylesheet from 'self' with htmx eval and indicator styles off — so the
+;;; policy cannot break a canvas page, and every canvas server gets it
+;;; without a wrapper of its own. Against 0.2.x: response bodies stay
+;;; byte-identical (pages, fragments, events, assets); every response gains
+;;; one header, the last. :csp nil gives 0.2.1's responses exactly, headers
+;;; included. The core transport stays opt-in (server.lisp).
+;;; The asset route below is gated and carries the header like any other
+;;; response: HTMX-APP wraps the :around (server.lisp, HTMX-APP).
+;;;
 ;;; Uploads (0.2.0, rpc-backend-htmx#5): the core codec hands a multipart file
 ;;; part to the handler as its STACK-MIME:MIME-ENTITY (codec.lisp), the value
 ;;; canvas-protocol (COERCE-PARAM part :file &key max-size accept multiple)
@@ -111,19 +129,29 @@ PAGE-KEYS is T or lists the message's method). See the file header."
 (defun make-canvas-htmx-transport (&key (prefix "/canvas/") (asset-prefix "/canvas-assets/")
                                      (page-title "canvas")
                                      (max-body-bytes rpc-backend-htmx:+default-max-body-bytes+)
+                                     (max-params rpc-backend-htmx:+default-max-params+)
                                      (error-target rpc-backend-htmx:+error-fragment-target+)
                                      (error-swap rpc-backend-htmx:+error-fragment-swap+)
-                                     page-keys)
+                                     page-keys
+                                     (csp t) token
+                                     (token-name rpc-backend-htmx:+default-token-name+))
+  "A CANVAS-HTMX-TRANSPORT. See the file header (Page keys, Security)."
   (check-type asset-prefix (and string (satisfies rpc-backend-htmx::%slash-bounded-p)))
   (check-type page-title string)
   (make-instance 'canvas-htmx-transport
                  :codec (rpc-backend-htmx:make-htmx-codec :prefix prefix
-                                                          :max-body-bytes max-body-bytes)
+                                                          :max-body-bytes max-body-bytes
+                                                          :max-params max-params)
                  :asset-prefix asset-prefix
                  :page-title page-title
                  :page-keys (and page-keys (%page-keys-option page-keys))
                  :error-target error-target
-                 :error-swap error-swap))
+                 :error-swap error-swap
+                 :csp (rpc-backend-htmx::%transport-csp csp)
+                 :token (and token (rpc-backend-htmx::%token-option token))
+                 :token-name (if (equal token-name rpc-backend-htmx:+default-token-name+)
+                                 token-name
+                                 (rpc-backend-htmx::%token-name-option token-name))))
 
 (defclass htmx-resolver (canvas:path-resolver)
   ((handlers :initarg :handlers :initform nil :reader htmx-resolver-handlers

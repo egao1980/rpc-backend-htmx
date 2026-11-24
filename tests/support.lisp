@@ -92,8 +92,11 @@
   (declare (ignore stream))
   (error "early <boom>"))
 
-(defun ticker-context (stream &key)
-  "Reads *HTMX-REQUEST* while streaming (the response runs after HTMX-HANDLE-REQUEST returned)."
+(defun ticker-context (stream &key n)
+  "Reads *HTMX-REQUEST* while streaming (the response runs after HTMX-HANDLE-REQUEST returned).
+Takes N, the param stream-request-context sends: 0.3.0 refuses a param the
+handler does not take (rpc-backend-htmx#2); 0.2.1 had (stream &key)."
+  (declare (ignore n))
   (rpc:rpc-send stream (cons "target" (getf (h:htmx-message-metadata h:*htmx-request*) :target)))
   (rpc:rpc-send stream (cons "method" (h:htmx-message-method h:*htmx-request*)))
   (rpc:rpc-send stream (cons "param" (getf (h:htmx-message-params h:*htmx-request*) :n))))
