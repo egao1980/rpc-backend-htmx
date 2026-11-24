@@ -124,3 +124,56 @@
         "the request's resolver (with its allowlist) is bound while the stream runs")
     (ok (notany (lambda (ev) (equal h:+stream-error-event+ (car ev))) (h:htmx-reply-events r))
         "no *canvas-resolver* is NIL error event")))
+
+;;; Sortable tables end to end (canvas-protocol#13). Every link a table emits
+;;; must be one its canvas takes: under the 0.3.0 key sets (#2) a param the
+;;; canvas does not take is a 400. An unpaged table canvas takes &key sort
+;;; alone, so its header links carry no page (canvas-protocol >= 0.2.2); a
+;;; paged one takes &key sort page.
+
+(defparameter *table-rows*
+  (list (list :name "Bo" :age 30) (list :name "Al" :age 25) (list :name "Cy" :age 41)))
+
+(defun sortable-columns ()
+  (list (canvas:column "Name" :name :name "name" :sortable t)
+        (canvas:column "Age" :age :name "age" :sortable t)))
+
+(defun sort-only-table (&key sort)
+  (canvas:table *table-rows* (sortable-columns) :id "t"
+                :link (canvas:canvas-link 'sort-only-table) :sort sort))
+
+(defun paged-table (&key sort page)
+  (canvas:table *table-rows* (sortable-columns) :id "t"
+                :link (canvas:canvas-link 'paged-table) :sort sort :page page :page-size 2))
+
+(defun table-client ()
+  (let ((tx (canvas-transport)))
+    (h:make-htmx-client (h:htmx-app tx (h:make-htmx-handlers 'sort-only-table 'paged-table))
+                        :codec (h:htmx-transport-codec tx))))
+
+(defun button-links (reply)
+  "The hx-get of every button in REPLY's fragment that has one, in document order."
+  (let ((html:*html-backend* (html-backend-plump:make-plump-backend)))
+    (loop for button in (html:select (h:htmx-reply-fragment reply) "button")
+          for url = (html:element-attr button "hx-get")
+          when url collect url)))
+
+(deftest table-header-click-on-sort-only-canvas
+  (let* ((c (table-client))
+         (first (h:htmx-request c (m "SORT-ONLY-TABLE") nil))
+         (links (button-links first)))
+    (ok (= 200 (h:htmx-reply-status first)))
+    (ok (= 2 (length links)) "one link per sortable header, no pager")
+    (dolist (url links)
+      (ok (not (search "page=" url)) (s+ "no page param: " url))
+      (let ((r (h:htmx-request-url c url)))
+        (ok (= 200 (h:htmx-reply-status r)) (s+ "header click is 200: " url))
+        (ok (contains "aria-sort=\"ascending\"" (h:htmx-reply-body r)) "the clicked sort applies")))))
+
+(deftest table-header-and-pager-clicks-on-paged-canvas
+  (let* ((c (table-client))
+         (links (button-links (h:htmx-request c (m "PAGED-TABLE") '(:sort "age")))))
+    (ok (= 3 (length links)) "two headers and Next (Previous is disabled)")
+    (ok (every (lambda (url) (search "page=" url)) links) "paged links carry page")
+    (dolist (url links)
+      (ok (= 200 (h:htmx-reply-status (h:htmx-request-url c url))) (s+ "click is 200: " url)))))

@@ -39,6 +39,7 @@
 (defsystem "rpc-backend-htmx/tests"
   :depends-on ("rpc-backend-htmx"
                "rpc-backend-htmx/canvas"
+               (:version "canvas-protocol" "0.2.2")
                (:version "rpc-protocol-json" "0.1.1")
                (:version "json-protocol" "0.2.3")
                (:version "json-backend-jzon" "0.2.3")
