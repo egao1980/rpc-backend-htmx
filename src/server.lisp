@@ -85,6 +85,14 @@
 ;;;   integers (→ decimal); anything else → RPC-INVALID-PARAMS. Unknown method or
 ;;;   a :call-stream entry → RPC-METHOD-NOT-FOUND. A :notify entry → "".
 ;;;   *HTMX-REQUEST* is bound to a message with no metadata.
+;;;   File params (0.2.0) have no JSON-RPC form: JSON-RPC handlers never see a
+;;;   MIME-ENTITY. A value that is not a string or an integer (an object such
+;;;   as {"filename": …, "content": …}, an array, a number with a fraction,
+;;;   true, false, null) → RPC-INVALID-PARAMS whose message is exactly
+;;;     Param <name> must be a string or an integer; JSON-RPC carries no file params
+;;;   (<name> the JSON key as sent). A string stays a string, so a handler's
+;;;   COERCE-PARAM :file refuses it ("<field> must be a file"). Uploads go
+;;;   through the htmx multipart route.
 
 (defparameter +stream-error-event+ "canvas-error"
   "SSE event name for an error after a stream opened.")
@@ -405,6 +413,9 @@ own condition boundary."
   (http-server-protocol:serve (htmx-app transport nil :stream-handler handler)
                               :host host :port port :backend backend))
 
+;;; 0.2.0 contract: the refusal's message gains "; JSON-RPC carries no file
+;;; params" (file header). Still 0.1.0's text here; jsonrpc-refuses-file-params
+;;; checks the new one.
 (defun %json-param-value (key value)
   (typecase value
     (string value)

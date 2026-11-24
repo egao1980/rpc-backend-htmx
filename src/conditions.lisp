@@ -8,14 +8,15 @@
 ;;; fragment (see server.lisp). Extension point: methods on
 ;;; HTMX-CONDITION-STATUS / HTMX-ERROR-RESPONSE, not a private error dialect.
 
-(define-condition htmx0-pending (error)
-  ((name :initarg :name :reader htmx0-pending-name))
+(define-condition htmx2-pending (error)
+  ((name :initarg :name :reader htmx2-pending-name))
   (:report (lambda (c s)
-             (format s "H4h-1b pending: ~A is not implemented yet" (htmx0-pending-name c)))))
+             (format s "0.2.0 pending: ~A is not implemented yet" (htmx2-pending-name c)))))
 
-(defun %htmx0-pending (name)
-  "Stub marker for the H4h-1b team-solve run. Not an HTMX-ERROR on purpose."
-  (error 'htmx0-pending :name name))
+(defun %htmx2-pending (name)
+  "Stub marker for the 0.2.0 team-solve run (#5 file parts, #6 page keys).
+Not an HTMX-ERROR on purpose: no test can pass by catching it."
+  (error 'htmx2-pending :name name))
 
 (define-condition htmx-error (rpc-protocol:rpc-error)
   ((status :initarg :status :initform 500 :reader htmx-error-status

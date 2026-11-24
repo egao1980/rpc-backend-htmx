@@ -26,7 +26,10 @@
 ;;;   :call-stream   (apply fn stream :allow-other-keys t params), STREAM an
 ;;;                  HTMX-EVENT-STREAM; the function RPC-SENDs events; returning
 ;;;                  ends the stream.
-;;; PARAMS is the keyword → string plist the codec decoded.
+;;; PARAMS is the keyword → value plist the codec decoded: strings, and (0.2.0)
+;;; for multipart file parts a STACK-MIME:MIME-ENTITY or a list of them
+;;; (codec.lisp, Multipart parts). A handler that wants an upload calls
+;;; canvas-protocol COERCE-PARAM :file on it, or reads the entity itself.
 
 (defparameter +htmx-handler-modes+ '(:call-response :notify :call-stream)
   "Modes a handler-table entry may have. Mode mapping (locked): hx-get / hx-post →

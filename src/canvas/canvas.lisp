@@ -28,22 +28,68 @@
 ;;;     handler running later inside the streaming response function.
 ;;;   HTMX-RESULT-NODES — the result through CANVAS:RENDER (components, charts,
 ;;;     strings, numbers, nodes, lists), flattened to a fresh list of nodes.
-;;;   HTMX-FULL-PAGE — (CANVAS:PAGE nodes :title (canvas-transport-page-title tx)),
-;;;     the html-document, so a plain browser GET gets a whole page with htmx loaded
-;;;     from the asset route; HX requests still get the fragment.
-;;;   HTMX-CONDITION-STATUS — CANVAS:CANVAS-COERCION-ERROR → 422; others as the core.
+;;;   HTMX-FULL-PAGE — (CANVAS:PAGE nodes :title (canvas-transport-page-title tx)
+;;;     :keys K), the html-document, so a plain browser GET gets a whole page with
+;;;     htmx loaded from the asset route; HX requests still get the fragment.
+;;;     K is NIL unless PAGE-KEYS (below) selects the page.
+;;;   HTMX-CONDITION-STATUS — CANVAS:CANVAS-COERCION-ERROR → 422 (its subclass
+;;;     CANVAS:CANVAS-UPLOAD-TOO-LARGE included); others as the core.
+;;;
+;;; Page keys (0.2.0, rpc-backend-htmx#6). canvas-protocol 0.2.0 binds key
+;;; chords with hx-get / hx-post :keys; the canvas:key event comes only from the
+;;; asset canvas-keys.js, which (CANVAS:PAGE … :keys t) loads.
+;;; MAKE-CANVAS-HTMX-TRANSPORT &key page-keys:
+;;;   NIL (default) — no page loads it; every response is byte-identical to 0.1.0.
+;;;   T — every full page loads it.
+;;;   a non-empty proper list of handler names, each a method symbol (as
+;;;     HTMX-METHOD-NAME takes it) or a "PKG::NAME" string (both sides
+;;;     non-empty) — only the full pages of those methods load it; the others
+;;;     stay byte-identical to 0.1.0. Only some canvases bind keys.
+;;;   Anything else (a keyword, a lone symbol or string, an improper list, or
+;;;   a list holding a keyword, a non-name or a malformed name) → TYPE-ERROR at
+;;;   construction (CHECK-TYPE, as for ASSET-PREFIX and PAGE-TITLE).
+;;; CANVAS-TRANSPORT-PAGE-KEYS → NIL, T, or a fresh list of method-name strings
+;;;   in the given order (symbols named at construction, so a later package
+;;;   rename does not change the selection).
+;;; HTMX-FULL-PAGE passes :keys T when PAGE-KEYS is T or lists the message's
+;;;   HTMX-MESSAGE-METHOD (STRING=), else :keys NIL. canvas-protocol then ends
+;;;   <head> with <script src="<asset-prefix>canvas-keys.js"></script>, right
+;;;   after the htmx and htmx-ext-sse scripts. Fragments (HX requests, POSTs),
+;;;   streams and error responses never carry a script, whatever PAGE-KEYS is.
+;;;   The asset route already serves canvas-keys.js (CANVAS:ASSET-NAMES).
+;;;
+;;; Uploads (0.2.0, rpc-backend-htmx#5): the core codec hands a multipart file
+;;; part to the handler as its STACK-MIME:MIME-ENTITY (codec.lisp), the value
+;;; canvas-protocol (COERCE-PARAM part :file &key max-size accept multiple)
+;;; takes; a FORM holding a FILE-INPUT already posts multipart/form-data.
+;;; Nothing upload-specific lives here beyond the 422 above.
 
 (defclass canvas-htmx-transport (rpc-backend-htmx:htmx-transport)
   ((asset-prefix :initarg :asset-prefix :initform "/canvas-assets/"
                  :reader canvas-transport-asset-prefix)
-   (page-title :initarg :page-title :initform "canvas" :reader canvas-transport-page-title))
+   (page-title :initarg :page-title :initform "canvas" :reader canvas-transport-page-title)
+   (page-keys :initarg :page-keys :initform nil :reader canvas-transport-page-keys
+              :documentation "NIL, T or a list of method-name strings (see the file header)."))
   (:documentation "htmx transport serving canvas functions, pages and canvas assets."))
+
+(defun %page-keys-option (page-keys)
+  "MAKE-CANVAS-HTMX-TRANSPORT's non-NIL PAGE-KEYS → T or a fresh list of
+method-name strings; anything else → TYPE-ERROR. See the file header."
+  (declare (ignore page-keys))
+  (rpc-backend-htmx::%htmx2-pending 'page-keys-option))
+
+(defun %page-keys-p (transport message)
+  "True when the full page for MESSAGE loads canvas-keys.js (TRANSPORT's
+PAGE-KEYS is T or lists the message's method). See the file header."
+  (declare (ignore transport message))
+  (rpc-backend-htmx::%htmx2-pending 'page-keys-p))
 
 (defun make-canvas-htmx-transport (&key (prefix "/canvas/") (asset-prefix "/canvas-assets/")
                                      (page-title "canvas")
                                      (max-body-bytes rpc-backend-htmx:+default-max-body-bytes+)
                                      (error-target rpc-backend-htmx:+error-fragment-target+)
-                                     (error-swap rpc-backend-htmx:+error-fragment-swap+))
+                                     (error-swap rpc-backend-htmx:+error-fragment-swap+)
+                                     page-keys)
   (check-type asset-prefix (and string (satisfies rpc-backend-htmx::%slash-bounded-p)))
   (check-type page-title string)
   (make-instance 'canvas-htmx-transport
@@ -51,6 +97,7 @@
                                                           :max-body-bytes max-body-bytes)
                  :asset-prefix asset-prefix
                  :page-title page-title
+                 :page-keys (and page-keys (%page-keys-option page-keys))
                  :error-target error-target
                  :error-swap error-swap))
 
@@ -126,8 +173,10 @@ else the canvas-protocol default) limited to HANDLERS."
     (flatten (canvas:render result))))
 
 (defmethod rpc-backend-htmx:htmx-full-page ((transport canvas-htmx-transport) nodes message)
-  (declare (ignore message))
-  (canvas:page nodes :title (canvas-transport-page-title transport)))
+  (canvas:page nodes :title (canvas-transport-page-title transport)
+                     :keys (and (canvas-transport-page-keys transport)
+                                (%page-keys-p transport message)
+                                t)))
 
 (defmethod rpc-backend-htmx:htmx-condition-status ((transport canvas-htmx-transport) condition)
   (if (typep condition 'canvas:canvas-coercion-error)

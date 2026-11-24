@@ -13,15 +13,51 @@
 ;;;   whose message is "Method not found: <rest>" (the server escapes it).
 ;;; - Params: ENV :QUERY-STRING (raw) first, then for POST the body, decoded as
 ;;;   application/x-www-form-urlencoded ("+" → space, UTF-8 percent-escapes) or
-;;;   multipart/form-data (every part → its name and its content as UTF-8 text;
-;;;   a filename is ignored). Decode with the stack: quri for urlencoded,
-;;;   mime-protocol (PARSE-MIME, media types, dispositions) for multipart,
-;;;   encoding-protocol for UTF-8. No private parsers.
+;;;   multipart/form-data (the part rules below). Decode with the stack: quri
+;;;   for urlencoded, mime-protocol (PARSE-MIME, media types, dispositions) for
+;;;   multipart, encoding-protocol for UTF-8. No private parsers.
 ;;;   An empty POST body needs no content type; a non-empty body of any other
 ;;;   type → HTMX-UNSUPPORTED-MEDIA-TYPE. Malformed input → HTMX-BAD-REQUEST.
-;;;   Result: a plist keyword → string. Key = (intern (string-upcase name) :keyword);
-;;;   empty names dropped; first-occurrence order; a later duplicate (query then
-;;;   body) replaces the value in place. Values are never read with the Lisp reader.
+;;;   Result: a plist keyword → value. Key = (intern (string-upcase name) :keyword);
+;;;   empty names dropped; first-occurrence order (of any kind of value).
+;;;   Values:
+;;;   - text (a query field, a urlencoded field, a multipart part without a
+;;;     filename): a string; a later text duplicate (query then body) replaces
+;;;     the value in place, as in 0.1.
+;;;   - file parts (0.2.0): one under a name → that STACK-MIME:MIME-ENTITY; two
+;;;     or more → a fresh list of them in part order (<input type="file"
+;;;     multiple>). A name that has a file part keeps only its file parts: text
+;;;     values under that name (query or body, before or after) are ignored, so
+;;;     a query string cannot stand in for an upload.
+;;;   Values are never read with the Lisp reader.
+;;;
+;;; Multipart parts (0.2.0, rpc-backend-htmx#5). Each part, in order:
+;;; - no Content-Disposition, no name parameter, or name "" → dropped (as in 0.1);
+;;; - a nested multipart part → HTMX-BAD-REQUEST (as in 0.1);
+;;; - a disposition without a filename (STACK-MIME:DISPOSITION-FILENAME is NIL:
+;;;   neither filename nor filename*) → a text field: its content as UTF-8
+;;;   text, invalid UTF-8 → HTMX-BAD-REQUEST. Unchanged from 0.1.
+;;; - filename "" → an empty file input (what a browser sends when no file was
+;;;   chosen) → dropped, so the param is missing unless another part of that
+;;;   name supplies a value.
+;;; - any other filename → a file: the value is the part itself, the
+;;;   STACK-MIME:MIME-ENTITY that PARSE-MIME returned, not a copy and not
+;;;   text. Its MIME-CONTENT-DISPOSITION and MIME-CONTENT-TYPE are
+;;;   mime-protocol's parse of the part headers, taken as they are (a part
+;;;   without a Content-Type: mime-protocol#13; a browser's raw UTF-8 or
+;;;   backslash in a filename: mime-protocol#14; fixes there reach handlers
+;;;   unchanged). MIME-CONTENT is the content octets exactly as sent (any
+;;;   octet, CR LF and "--" included; a part with a Content-Transfer-Encoding
+;;;   is decoded by mime-protocol, though browsers never send one, RFC 7578
+;;;   §4.7). Nothing is decoded as text, read with the Lisp reader or written
+;;;   to disk; FILENAME is the client's and is never used as a path here.
+;;; - A filename* mime-protocol cannot read (MIME-ERROR) → HTMX-BAD-REQUEST.
+;;; The body limit is unchanged: MAX-BODY-BYTES covers the whole body, files
+;;; included (413 below); the body is parsed in memory. A per-field limit is the
+;;; handler's (canvas-protocol COERCE-PARAM :file :max-size).
+;;; mime-protocol ≥ 0.3.0 is required: it keeps a part whose content is empty or
+;;; ends in CR LF intact (mime-protocol#9), which is exactly an empty file input,
+;;; a textarea value ending in a line break, or a binary file.
 ;;; - Body size: at most MAX-BODY-BYTES octets are ever read. A Content-Length
 ;;;   above the limit → HTMX-BODY-TOO-LARGE (:size = that length) before reading
 ;;;   anything; without Content-Length, read at most limit+1 octets and signal
@@ -44,20 +80,59 @@
 ;;;                             metadata headers) → a Clack env plist, what a
 ;;; browser running htmx would send. METHOD: a method-name string or a symbol
 ;;; (HTMX-METHOD-NAME). PARAMS: plist keyword → string or integer (decimal),
-;;; NIL values dropped. HTTP-METHOD :GET (default; params in the query string)
-;;; or :POST (params in the body). ENCODING :URLENCODED (default) or :MULTIPART
-;;; (POST only). METADATA: a plist like the decoded one (:request T → "HX-Request:
-;;; true"). HEADERS: extra alist (name . value), sent as given (lowercased names).
+;;; NIL values dropped; 0.2.0 adds file values (below). HTTP-METHOD :GET
+;;; (default; params in the query string) or :POST (params in the body).
+;;; ENCODING :URLENCODED (default) or :MULTIPART (POST only). METADATA: a plist
+;;; like the decoded one (:request T → "HX-Request: true"). HEADERS: extra alist
+;;; (name . value), sent as given (lowercased names).
 ;;; The env has :request-method :script-name "" :path-info (prefix + method,
 ;;; decoded) :request-uri (prefix + percent-encoded method + "?query")
 ;;; :query-string (raw, or NIL) :server-name "localhost" :server-port 80
 ;;; :server-protocol :http/1.1 :url-scheme "http" :remote-addr "127.0.0.1"
 ;;; :headers (EQUAL hash table, lowercase keys) and, for POST, :content-type
 ;;; :content-length and :raw-body (HTTP-PROTOCOL:MAKE-OCTET-INPUT-STREAM).
-;;; Encode with the stack: HTTP-PROTOCOL:ENCODE-URLENCODED / MAKE-MULTIPART-BODY
-;;; (or mime-protocol MAKE-FORM-DATA). ID is ignored.
+;;; Encode with the stack: HTTP-PROTOCOL:ENCODE-URLENCODED / MAKE-MULTIPART-BODY.
+;;; ID is ignored.
 ;;; ENCODE-NOTIFICATION-USING-CODEC: the same with HTTP-METHOD :POST.
-;;; Round trip: DECODE of ENCODE gives back the method and the params (as strings).
+;;; Round trip: DECODE of ENCODE gives back the method and the params (text
+;;; params as strings; files as below).
+;;;
+;;; File values (0.2.0, rpc-backend-htmx#5). A param value may also be a file
+;;; value or a non-empty proper list of file values (one part each, in list
+;;; order: <input type="file" multiple>). A file value is a plist
+;;;   (:filename F [:content C] [:content-type T])
+;;; the file shape of mime-protocol MAKE-FORM-DATA and http-protocol :files:
+;;;   F  a string, the part's filename; "" sends an empty file input.
+;;;   C  a vector of (unsigned-byte 8), sent as is; a string, sent as UTF-8;
+;;;      or NIL / absent: no content.
+;;;   T  a string STACK-MIME:PARSE-MEDIA-TYPE accepts, with no control
+;;;      character and not of type multipart (the server refuses a nested
+;;;      multipart part); sent as given; absent: "application/octet-stream".
+;;; An odd or improper plist, a key other than these three, a repeated key, F
+;;; missing or not a string, or C / T of another type → HTMX-ERROR (500, a
+;;; caller bug). File values need HTTP-METHOD :POST and ENCODING :MULTIPART;
+;;; with :GET or :URLENCODED → HTMX-ERROR. Any other value (a list of strings,
+;;; a symbol, a float …) → HTMX-ERROR, as in 0.1.
+;;; The multipart body holds one part per text field, in PARAMS order, then
+;;; one part per file, in PARAMS order and list order. This is
+;;; HTTP-PROTOCOL:MAKE-MULTIPART-BODY's order (fields, then files); servers
+;;; that read fields before files rely on it. With B the boundary and N the
+;;; lowercased key name, a text part is (as in 0.1)
+;;;   --B CRLF Content-Disposition: form-data; name="N" CRLF CRLF <UTF-8 value> CRLF
+;;; and a file part, raw octets the way a browser sends them (no
+;;; Content-Transfer-Encoding, no base64):
+;;;   --B CRLF Content-Disposition: <FORMAT-FORM-DATA-DISPOSITION N :filename F> CRLF
+;;;   Content-Type: T CRLF CRLF <C> CRLF
+;;; and the body ends --B-- CRLF. Build it with http-protocol's encoder,
+;;; MAKE-MULTIPART-BODY (text fields as DATA, files as FILES), never a private
+;;; writer: it quotes N and F through mime-protocol (" CR LF percent-encoded,
+;;; filename* added for a non-ASCII F). mime-protocol MAKE-FORM-DATA is not
+;;; used for files: it base64-encodes binary parts, which no browser does.
+;;; :content-type is "multipart/form-data; boundary=B", :content-length the
+;;; body's octet count.
+;;; Round trip: DECODE of ENCODE gives each text param back as a string and
+;;; each file as a MIME-ENTITY with filename F, media type T and content C
+;;; (as octets); a file value with F "" comes back missing.
 ;;;
 ;;; ENCODE-RESPONSE-USING-CODEC (codec result &key id status headers)
 ;;; → (status clack-headers (body-string)).
@@ -121,7 +196,8 @@
   ((method :initarg :method :reader htmx-message-method
            :documentation "Method name string \"PKG::NAME\".")
    (params :initarg :params :initform nil :reader htmx-message-params
-           :documentation "Plist keyword → string.")
+           :documentation "Plist keyword → string, STACK-MIME:MIME-ENTITY (a file part)
+or a list of entities (several files under one name). See the file header.")
    (metadata :initarg :metadata :initform nil :reader htmx-message-metadata
              :documentation "Plist, see +REQUEST-METADATA-HEADERS+.")
    (mode :initarg :mode :initform :call-response :reader htmx-message-mode
@@ -224,8 +300,16 @@ Empty names are dropped; a field without = has the value \"\"."
     (stack-encoding:encoding-error ()
       (error 'htmx-bad-request :message "Invalid UTF-8 in urlencoded data"))))
 
+(defun %file-part-pairs (name part)
+  "The pairs a file PART (its disposition has a filename parameter) named NAME
+contributes: () for an empty file input (filename \"\"), else ((NAME . PART)),
+PART itself. See the file header (Multipart parts)."
+  (declare (ignore name part))
+  (%htmx2-pending 'file-part-pairs))
+
 (defun %multipart-pairs (media-type body)
-  "multipart/form-data BODY (octets) → ((name . value) …) in part order.
+  "multipart/form-data BODY (octets) → ((name . value) …) in part order: VALUE
+the UTF-8 text of a text part, or the part itself for a file part (0.2.0).
 mime-protocol parses the entity; the header block it reads is rebuilt from
 the parsed MEDIA-TYPE, never copied from the request."
   (handler-case
@@ -242,7 +326,10 @@ the parsed MEDIA-TYPE, never copied from the request."
               when (stack-mime:multipart-p part)
                 do (error 'htmx-bad-request :message "Nested multipart is not supported")
               when (and name (plusp (length name)))
-                collect (cons name (%utf8-string (%octets (stack-mime:mime-content part))))))
+                if (stack-mime:disposition-filename disposition)
+                  nconc (%file-part-pairs name part)
+                else
+                  collect (cons name (%utf8-string (%octets (stack-mime:mime-content part))))))
     (stack-mime:mime-error ()
       (error 'htmx-bad-request :message "Malformed multipart body"))
     (stack-encoding:encoding-error ()
@@ -266,9 +353,19 @@ the parsed MEDIA-TYPE, never copied from the request."
                (%multipart-pairs media-type body))
               (t (error 'htmx-unsupported-media-type :content-type content-type)))))))
 
+(defun %file-params-plist (pairs)
+  "%PARAMS-PLIST for PAIRS that hold file parts: keys in first-occurrence
+order; text values as in 0.1; a name with file parts takes only those (one →
+the entity, several → a fresh list in part order). See the file header."
+  (declare (ignore pairs))
+  (%htmx2-pending 'file-params-plist))
+
 (defun %params-plist (pairs)
   "PAIRS in wire order → keyword plist; first-occurrence order, later
-duplicates replace the value in place. Values stay strings."
+duplicates replace the value in place. Values stay strings.
+0.2.0: PAIRS holding a file part go to %FILE-PARAMS-PLIST."
+  (when (some (lambda (pair) (stack-mime:mime-entity-p (cdr pair))) pairs)
+    (return-from %params-plist (%file-params-plist pairs)))
   (let ((cells (make-hash-table :test 'eq)) ; lookup only, never iterated
         (out '()))
     (loop for (name . value) in pairs
@@ -391,10 +488,26 @@ duplicates replace the value in place. Values stay strings."
            (n (read-sequence buffer stream)))
       (values (subseq buffer 0 n) content-type))))
 
+(defun %file-params-p (params)
+  "True when some value of PARAMS is a cons: a file value, a list of them, or
+a list the file rules refuse. Those requests go to %ENCODE-FILE-REQUEST."
+  (loop for (nil value) on params by #'cddr thereis (consp value)))
+
+(defun %encode-file-request (codec method params http-method encoding metadata headers)
+  "ENCODE-REQUEST-USING-CODEC for PARAMS with a cons value: validate the file
+values, refuse them outside :POST :MULTIPART, and build the multipart body with
+HTTP-PROTOCOL:MAKE-MULTIPART-BODY (text fields as DATA, files as FILES).
+See the file header (File values)."
+  (declare (ignore codec method params http-method encoding metadata headers))
+  (%htmx2-pending 'encode-file-request))
+
 (defmethod rpc-protocol:encode-request-using-codec
     ((codec htmx-codec) method params &key id (http-method :get) (encoding :urlencoded)
                                         metadata headers)
   (declare (ignore id))
+  (when (%file-params-p params)
+    (return-from rpc-protocol:encode-request-using-codec
+      (%encode-file-request codec method params http-method encoding metadata headers)))
   (let* ((name (%method-string method))
          (alist (%params-alist params))
          (form (and alist (%octets (http-protocol:encode-urlencoded alist))))

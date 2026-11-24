@@ -7,6 +7,11 @@
 ;;; (HTMX-REQUEST client method params &key http-method encoding hx-request
 ;;;               target trigger trigger-name current-url boosted accept headers)
 ;;;   Builds the env with ENCODE-REQUEST-USING-CODEC on the client's codec.
+;;;   PARAMS as that method takes them: strings, integers, and (0.2.0) file
+;;;   values (:filename F :content C :content-type T) or lists of them, which
+;;;   need :HTTP-METHOD :POST :ENCODING :MULTIPART and are sent as raw binary
+;;;   parts the way a browser sends a form with a file input (codec.lisp,
+;;;   File values). Other combinations → HTMX-ERROR before the app is called.
 ;;;   HX-REQUEST (default T) sends "HX-Request: true"; TARGET, TRIGGER,
 ;;;   TRIGGER-NAME, CURRENT-URL, BOOSTED (T → "true") the matching HX-* header;
 ;;;   ACCEPT an Accept header; HEADERS extra (name . value) pairs.

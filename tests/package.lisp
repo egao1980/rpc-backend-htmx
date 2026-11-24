@@ -4,6 +4,7 @@
                     (#:hc #:rpc-backend-htmx/canvas)
                     (#:rpc #:rpc-protocol)
                     (#:html #:html-protocol)
-                    (#:sse #:sse-protocol)))
+                    (#:sse #:sse-protocol)
+                    (#:mime #:mime-protocol)))
 
 (in-package #:rpc-backend-htmx/tests)

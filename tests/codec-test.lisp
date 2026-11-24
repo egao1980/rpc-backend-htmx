@@ -18,12 +18,14 @@
         "query first, body replaces in place")))
 
 (deftest decode-post-multipart
+  ;; 0.1 also had a part with filename="n.txt" here, read as text ("a filename
+  ;; is ignored"). 0.2.0 makes such a part a file: multipart-test.lisp.
   (let* ((body (crlf "--XyZ"
                      "Content-Disposition: form-data; name=\"name\""
                      ""
                      "Zoë"
                      "--XyZ"
-                     "Content-Disposition: form-data; name=\"note\"; filename=\"n.txt\""
+                     "Content-Disposition: form-data; name=\"note\""
                      "Content-Type: text/plain"
                      ""
                      "line"
