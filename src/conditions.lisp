@@ -49,8 +49,8 @@ pass by catching it."
 (define-condition htmx-forbidden (htmx-error) ()
   (:default-initargs :status 403 :code rpc-protocol:+invalid-request+
                      :message "Forbidden")
-  (:documentation "The token gate refused the request (#4): no valid cookie, a bad
-token, or a one-time URL already used. server.lisp, Token gate."))
+  (:documentation "The token gate refused the request (#4): no valid session cookie, a
+wrong or already used bootstrap token. server.lisp, Token gate."))
 
 (define-condition htmx-method-not-allowed (htmx-error) ()
   (:default-initargs :status 405 :code rpc-protocol:+invalid-request+

@@ -123,14 +123,28 @@
 ;;; the header the same way; the events are untouched. Exactly one such header
 ;;; per response; bodies are never changed.
 ;;;
-;;; Token gate (0.3.0, #4). TOKEN is:
+;;; Token gate (0.3.0, #4). Two secrets, never the same value:
+;;;   the BOOTSTRAP token — TOKEN, the caller's; it travels in the one-time URL,
+;;;     and URLs leak (browser history, Referer, proxy and server logs,
+;;;     terminal scrollback), so it is good for exactly one exchange;
+;;;   the SESSION secret — the app's own, the only value the cookie ever
+;;;     carries. Never in a URL, never derived from TOKEN.
+;;; TOKEN is:
 ;;;   NIL (default) — no gate (0.2.1).
-;;;   the per-run secret: a string, or an HTTP-PROTOCOL:SECRET wrapping one, of
-;;;     32 to 512 characters from [A-Za-z0-9_-] (base64url or hex: safe
-;;;     unencoded in a cookie and in a URL). The caller makes it, from a CSPRNG,
-;;;     once per run. Kept as an HTTP-PROTOCOL:SECRET (prints redacted);
-;;;     HTMX-TRANSPORT-TOKEN returns that SECRET.
+;;;   a string, or an HTTP-PROTOCOL:SECRET wrapping one, of 32 to 512
+;;;     characters from [A-Za-z0-9_-] (base64url or hex: safe unencoded in a
+;;;     URL). The caller makes it from a CSPRNG, once per run (e.g.
+;;;     SECRETS-PROTOCOL:TOKEN-URLSAFE 32). Kept as an HTTP-PROTOCOL:SECRET
+;;;     (prints redacted); HTMX-TRANSPORT-TOKEN returns that SECRET.
 ;;;   Anything else → TYPE-ERROR.
+;;; The session secret: (SECRETS-PROTOCOL:TOKEN-URLSAFE 32) — 32 octets (256
+;;;   bits) from the stack's CSPRNG, base64url without padding (43
+;;;   characters) — made by HTMX-APP for each app it builds while a token is in
+;;;   force, so a missing secrets backend fails there (SECRETS-PROTOCOL:
+;;;   SECRETS-ERROR; loading crypto-backend-ironclad installs one), never at a
+;;;   login. Kept as an HTTP-PROTOCOL:SECRET inside the app; sent only in the
+;;;   exchange's Set-Cookie. rpc-backend-htmx depends on secrets-protocol, not
+;;;   on a backend: the application picks it, as for every stack protocol.
 ;;; TOKEN-NAME (default +DEFAULT-TOKEN-NAME+, "canvas-token") — the cookie's
 ;;;   name and the one-time URL's query field: a non-empty string of
 ;;;   [A-Za-z0-9_-], else TYPE-ERROR. Cookies are not isolated by port (RFC
@@ -147,48 +161,50 @@
 ;;;     (URL-DECODE-PARAMS :lenient t :percent-decode nil);
 ;;;   cookies — the "cookie" request header split the same way with
 ;;;     :delimiter #\;, names trimmed of spaces and tabs;
-;;;   values compared raw (no percent-decoding) and in constant time (one
-;;;     internal function, %TOKEN=: its time depends on the token's length
-;;;     only, never on where a value first differs; a value of another length
-;;;     is unequal). crypto-protocol has no constant-time equality to reuse.
-;;;   The cookie is VALID when some cookie named TOKEN-NAME has the token as its
-;;;   value.
-;;; 1. The query has a field named TOKEN-NAME (exactly, raw) — the one-time URL:
-;;;    a. exactly one such field, its value is the token, and this app's
-;;;       one-time URL is unused → mark it used and answer 303, no body, with
+;;;   values compared raw (no percent-decoding) and in constant time: one
+;;;     internal function, %TOKEN= (presented secret), which is
+;;;     SECRETS-PROTOCOL:CONSTANT-TIME-EQUAL on the UTF-8 octets of both.
+;;;   The cookie is VALID when some cookie named TOKEN-NAME has the SESSION
+;;;   secret as its value. A cookie holding TOKEN is not valid.
+;;; 1. The query has a field named TOKEN-NAME (exactly, raw) — the exchange:
+;;;    a. exactly one such field, its value is TOKEN, and this app's bootstrap
+;;;       token is unused → mark it used and answer 303, no body, with
 ;;;       headers, in this order:
 ;;;         :location L   :set-cookie C   :cache-control "no-store"
 ;;;       C is exactly
-;;;         <TOKEN-NAME>=<TOKEN>; Path=/; HttpOnly; SameSite=Strict
+;;;         <TOKEN-NAME>=<SESSION>; Path=/; HttpOnly; SameSite=Strict
 ;;;       followed by "; Secure" when ENV :URL-SCHEME is "https" (any case), and
 ;;;       never otherwise: a loopback bind is plain http, where a Secure cookie
 ;;;       is not stored. No Domain (host-only), no Max-Age / Expires (a session
-;;;       cookie; the token dies with the run). Path=/ covers the method prefix
+;;;       cookie; the secret dies with the run). Path=/ covers the method prefix
 ;;;       and the asset prefix alike. HttpOnly: no script reads it; SameSite=
 ;;;       Strict: no other site's page sends it (cross-site request forgery).
-;;;    b. else, when the cookie is valid → 303, no body, headers :location L
-;;;       :cache-control "no-store" (no Set-Cookie): a browser that is already
-;;;       in follows a used link without an error.
-;;;    c. else → 403 (HTMX-FORBIDDEN). A failed attempt does not use the URL.
-;;;    L is the path of ENV :REQUEST-URI (all before "?") and, when other
-;;;    fields remain, "?" and those fields raw, in order, each "name=value"
-;;;    ("name" alone for a field without "="), joined by "&". When that path
-;;;    does not start with "/", starts with "//" or "/\", or holds a control
-;;;    character or a space → 403 (c) instead of a or b, so the redirect can
+;;;    b. anything else → 403 (HTMX-FORBIDDEN): a used bootstrap token, a
+;;;       wrong one, the session secret presented as one, the field twice —
+;;;       even when the request also carries a valid cookie. A request that
+;;;       fails here does not use the bootstrap token.
+;;;    L, the clean URL, is the path of ENV :REQUEST-URI (all before "?") and,
+;;;    when other fields remain, "?" and those fields raw, in order, each
+;;;    "name=value" ("name" alone for a field without "="), joined by "&": the
+;;;    token never stays in the address bar or reaches the handler. When that
+;;;    path does not start with "/", starts with "//" or "/\", or holds a
+;;;    control character or a space → 403 instead of a, so the redirect can
 ;;;    never leave the origin.
 ;;; 2. Otherwise: the cookie is valid → the request goes on (step 2 of HTMX-APP);
 ;;;    else → 403 (HTMX-FORBIDDEN).
 ;;; The 403 is (HTMX-ERROR-RESPONSE transport condition): the error fragment
 ;;; with status 403, so a browser shows it in the error target. It never
 ;;; echoes a value the request sent.
-;;; "Used" is per app: each HTMX-APP call has its own one-time state (one
-;;; transport can back several apps, each with one login), set under a lock
-;;; (bordeaux-threads): of concurrent valid logins exactly one gets 1a.
-;;; Threat model: the token is a bearer secret for the run. The one-time URL
-;;; stops a second browser from following a link that was already used (a
-;;; link pasted on, a shared screen); whoever can read the token itself can
-;;; still present the cookie, so do not log the URL. JSONRPC-HANDLER is not
-;;; gated: the JSON-RPC server it runs in authenticates its own clients.
+;;; State is per app: each HTMX-APP call has its own session secret and its
+;;; own bootstrap use (one transport can back several apps, each with one
+;;; exchange; a cookie from one app is not valid on another). The use is
+;;; marked under a lock (bordeaux-threads): of concurrent valid exchanges
+;;; exactly one gets 1a.
+;;; Threat model: a leaked one-time URL is worthless once used (the exchange
+;;; consumed it, and it was never the cookie); a leaked unused one gives one
+;;; session, so open it at once. The session secret stays in the browser's
+;;; HttpOnly cookie jar. JSONRPC-HANDLER is not gated: the JSON-RPC server it
+;;; runs in authenticates its own clients.
 ;;;
 ;;; JSONRPC-HANDLER (transport handlers) → (lambda (method params) → string), for
 ;;;   any JSON-RPC server (rpc-backend-http MAKE-RPC-APP, …). Same table, same
@@ -318,14 +334,16 @@ See the file header (Token gate)."
 ;;; App wrapping (0.3.0 contract: stubs). File header, HTMX-APP,
 ;;; Content-Security-Policy and Token gate.
 
-(defun %token= (presented token)
-  "True when the string PRESENTED is TOKEN (a string), compared in constant time."
-  (declare (ignore presented token))
+(defun %token= (presented secret)
+  "True when the string PRESENTED is SECRET (a string): SECRETS-PROTOCOL:
+CONSTANT-TIME-EQUAL on their UTF-8 octets."
+  (declare (ignore presented secret))
   (%htmx3-pending 'token=))
 
 (defun %token-gate (transport token token-name state env)
   "NIL when ENV may go on to HTMX-HANDLE-REQUEST, else the gate's response (a
-303 or a 403). TOKEN a SECRET; STATE this app's one-time state."
+303 or a 403). TOKEN the bootstrap SECRET; STATE this app's session secret and
+bootstrap use (file header, Token gate)."
   (declare (ignore transport token token-name state env))
   (%htmx3-pending 'token-gate))
 
@@ -344,9 +362,11 @@ the file header."
   (check-type transport htmx-transport)
   (check-type handler (or htmx-handlers function null))
   (check-type stream-handler (or function null))
-  ;; 0.3.0 contract: validate the supplied options, then gate, handle and add
-  ;; the CSP header per request (%TOKEN-GATE, %WITH-CSP; file header). Still
-  ;; 0.2.1 here: the options are validated, never applied.
+  ;; 0.3.0 contract: validate the supplied options; with a token in force make
+  ;; this app's session secret (SECRETS-PROTOCOL:TOKEN-URLSAFE 32) and its
+  ;; bootstrap use; then gate, handle and add the CSP header per request
+  ;; (%TOKEN-GATE, %WITH-CSP; file header). Still 0.2.1 here: the options are
+  ;; validated, never applied.
   (when csp-p (%transport-csp csp))
   (when (and token-p token) (%token-option token))
   (when (and token-name-p (not (equal token-name +default-token-name+)))

@@ -11,6 +11,7 @@
                (:version "html-protocol" "0.1.1")
                (:version "mime-protocol" "0.3.1")
                (:version "encoding-protocol" "0.2.0")
+               (:version "secrets-protocol" "0.1.3")
                "quri"
                "bordeaux-threads")
   :serial t
@@ -43,6 +44,7 @@
                (:version "json-backend-jzon" "0.2.3")
                (:version "rpc-backend-http" "0.1.2")
                (:version "html-backend-plump" "0.1.1")
+               (:version "crypto-backend-ironclad" "0.2.2")
                (:version "rove" "0.11.1"))
   :pathname "tests"
   :serial t

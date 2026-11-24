@@ -1,9 +1,11 @@
 (in-package #:rpc-backend-htmx/tests)
 
-;;; 0.3.0 (rpc-backend-htmx#4): the per-run token gate. A one-time URL sets the
-;;; token as an HttpOnly, SameSite=Strict cookie; every other request needs
-;;; the cookie, else 403 before anything is decoded or called. Rules:
-;;; src/server.lisp (Token gate).
+;;; 0.3.0 (rpc-backend-htmx#4): the per-run token gate. The one-time URL
+;;; carries a single-use bootstrap token; exchanging it sets an HttpOnly,
+;;; SameSite=Strict cookie holding a separate session secret from the stack's
+;;; CSPRNG (crypto-backend-ironclad, a test dependency, installs the secrets
+;;; backend). Every other request needs that cookie, else 403 before anything
+;;; is decoded or called. Rules: src/server.lisp (Token gate).
 
 (defparameter +token+ "Tk_0123456789abcdefghijklmnopqrstuvwxyz-ABC"
   "43 characters of [A-Za-z0-9_-].")
@@ -35,9 +37,25 @@
 (defun cookie (value &optional (name "canvas-token"))
   (list (cons "cookie" (s+ name "=" value))))
 
+(defun set-cookie-value (reply &optional (name "canvas-token"))
+  "The value the Set-Cookie of REPLY gives the cookie NAME, or NIL."
+  (let* ((header (hdr reply "Set-Cookie"))
+         (prefix (s+ name "=")))
+    (when (and header (eql 0 (search prefix header)))
+      (subseq header (length prefix) (position #\; header)))))
+
+(defun base64url-p (string)
+  (every (lambda (c) (or (alphanumericp c) (find c "-_"))) string))
+
 (defun visit (c url &rest keys)
   "A plain browser GET of URL."
   (apply #'h:htmx-request-url c url :hx-request nil keys))
+
+(defun login (c &key (url +gated-url+) (token-name "canvas-token"))
+  "Exchange the bootstrap token through C's app → the session secret its cookie holds."
+  (let ((r (visit c (h:htmx-token-url url +token+ :token-name token-name))))
+    (and (= 303 (h:htmx-reply-status r))
+         (set-cookie-value r token-name))))
 
 (defun forbidden-p (reply)
   (and (= 403 (h:htmx-reply-status reply))
@@ -117,61 +135,122 @@
 
 (deftest gate-cookie
   (setf *gated-calls* 0)
-  (let ((c (gated-client)))
+  (let* ((c (gated-client))
+         (session (login c)))
+    (ok (stringp session) "the exchange set a cookie")
     (flet ((with-cookie (header)
              (h:htmx-request c (m "GATED-CANVAS") '(:q "1") :headers (list (cons "cookie" header)))))
-      (let ((r (with-cookie (s+ "canvas-token=" +token+))))
+      (let ((r (with-cookie (s+ "canvas-token=" session))))
         (ok (= 200 (h:htmx-reply-status r)))
         (ok (equal "<p>1</p>" (h:htmx-reply-body r)))
         (ok (= 1 *gated-calls*)))
-      (ok (= 200 (h:htmx-reply-status (with-cookie (s+ "a=1; canvas-token=" +token+ "; b=2"))))
+      (ok (= 200 (h:htmx-reply-status (with-cookie (s+ "a=1; canvas-token=" session "; b=2"))))
           "among other cookies")
-      (ok (= 200 (h:htmx-reply-status (with-cookie (format nil "a=1;~C canvas-token=~A" #\Tab +token+))))
+      (ok (= 200 (h:htmx-reply-status (with-cookie (format nil "a=1;~C canvas-token=~A" #\Tab session))))
           "names trimmed of spaces and tabs")
-      (ok (= 200 (h:htmx-reply-status (with-cookie (s+ "canvas-token=wrong; canvas-token=" +token+))))
-          "some cookie of that name carries the token")
-      (dolist (bad (list "" (subseq +token+ 0 42) (s+ +token+ "x") (string-upcase +token+)
-                         (s+ (subseq +token+ 0 42) "D") (s+ "\"" +token+ "\"")))
+      (ok (= 200 (h:htmx-reply-status (with-cookie (s+ "canvas-token=wrong; canvas-token=" session))))
+          "some cookie of that name carries the session secret")
+      (dolist (bad (list "" (subseq session 0 42) (s+ session "x") (string-upcase session)
+                         (s+ (subseq session 0 42) (if (char= #\A (char session 42)) "B" "A"))
+                         (s+ "\"" session "\"")))
         (ok (forbidden-p (with-cookie (s+ "canvas-token=" bad))) (format nil "value ~S" bad)))
-      (ok (forbidden-p (with-cookie (s+ "canvas-tokens=" +token+))) "another name")
-      (ok (forbidden-p (with-cookie (s+ "x-canvas-token=" +token+))) "another name"))
+      (ok (forbidden-p (with-cookie (s+ "canvas-tokens=" session))) "another name")
+      (ok (forbidden-p (with-cookie (s+ "x-canvas-token=" session))) "another name"))
     (ok (forbidden-p (h:htmx-request c (m "GATED-CANVAS") nil
-                                     :headers (list (cons "x-token" +token+))))
+                                     :headers (list (cons "x-token" session))))
         "only the cookie counts")
     (let ((r (h:htmx-request c (m "GATED-TICKER") nil :accept "text/event-stream"
-                                                      :headers (cookie +token+))))
+                                                      :headers (cookie session))))
       (ok (= 200 (h:htmx-reply-status r)))
       (ok (equal '(("row" . "x")) (h:htmx-reply-events r)) "a stream with the cookie"))
     (ok (equalp (canvas:asset-bytes "htmx.min.js")
                 (h:htmx-reply-body (h:htmx-request-env
                                     c (env :path "/canvas-assets/htmx.min.js"
-                                           :headers (cookie +token+)))))
+                                           :headers (cookie session)))))
         "an asset with the cookie")))
 
 (deftest one-time-url-login
   (setf *gated-calls* 0)
   (let* ((c (gated-client))
          (url (h:htmx-token-url (s+ +gated-url+ "?q=%C3%A9") +token+))
-         (r (visit c url)))
+         (r (visit c url))
+         (session (set-cookie-value r)))
     (ok (equal (s+ +gated-url+ "?q=%C3%A9&canvas-token=" +token+) url))
     (ok (= 303 (h:htmx-reply-status r)))
+    (ok (stringp session))
     (ok (equal (list (cons "location" (s+ +gated-url+ "?q=%C3%A9"))
-                     (cons "set-cookie" (s+ "canvas-token=" +token+ +cookie-attributes+))
+                     (cons "set-cookie" (s+ "canvas-token=" session +cookie-attributes+))
                      (cons "cache-control" "no-store")
                      (cons "content-security-policy" +brief-csp+))
                (h:htmx-reply-headers r))
-        "Location without the token, the cookie, no-store, the CSP; in that order")
+        "the clean URL, the session cookie, no-store, the CSP; in that order")
     (ok (equal "" (h:htmx-reply-body r)) "no body")
-    (ok (= 0 *gated-calls*) "the login calls nothing")
-    (let ((page (visit c (hdr r "Location") :headers (cookie +token+))))
+    (ok (= 0 *gated-calls*) "the exchange calls nothing")
+    (let ((page (visit c (hdr r "Location") :headers (cookie session))))
       (ok (= 200 (h:htmx-reply-status page)))
-      (ok (contains "<p>é</p>" (h:htmx-reply-body page)) "the browser follows it with the cookie"))
-    (ok (forbidden-p (visit c url)) "used: a second browser is refused")
-    (let ((again (visit c url :headers (cookie +token+))))
-      (ok (= 303 (h:htmx-reply-status again)) "used, but this browser has the cookie")
-      (ok (equal (s+ +gated-url+ "?q=%C3%A9") (hdr again "Location")))
-      (ok (null (hdr again "Set-Cookie")) "no cookie set again")
-      (ok (equal "no-store" (hdr again "Cache-Control"))))))
+      (ok (contains "<p>é</p>" (h:htmx-reply-body page)) "the browser follows it with the cookie"))))
+
+;;; The coordinator's three properties: (1) a fresh session secret, (2) a
+;;; single-use bootstrap token, (3) the two never stand in for each other.
+
+(deftest exchange-issues-a-fresh-session-secret
+  (let* ((c (gated-client))
+         (session (login c)))
+    (ok (stringp session))
+    (ok (string/= +token+ session) "not the bootstrap token")
+    (ok (not (search +token+ session)) "nor holding it")
+    (ok (= 43 (length session)) "32 CSPRNG octets, base64url without padding")
+    (ok (base64url-p session))
+    (ok (= 200 (h:htmx-reply-status (visit c +gated-url+ :headers (cookie session)))))
+    (let ((other (login (gated-client))))
+      (ok (and (stringp other) (string/= session other))
+          "another app over another transport: another secret"))
+    (let* ((tx (gated-transport))
+           (a (login (gated-client tx)))
+           (b (login (gated-client tx))))
+      (ok (and a b (string/= a b)) "two apps over one transport: two secrets"))))
+
+(deftest bootstrap-token-is-single-use
+  (let* ((c (gated-client))
+         (url (h:htmx-token-url +gated-url+ +token+))
+         (session (login c)))
+    (ok (stringp session))
+    (ok (forbidden-p (visit c url)) "a second use: 403")
+    (let ((again (visit c url :headers (cookie session))))
+      (ok (forbidden-p again) "a second use with a valid cookie: still 403")
+      (ok (null (hdr again "Set-Cookie")) "no cookie set again"))
+    (ok (forbidden-p (visit c (s+ +gated-url+ "?q=1&canvas-token=" +token+)
+                            :headers (cookie session)))
+        "nor under another URL")
+    (ok (= 200 (h:htmx-reply-status (visit c +gated-url+ :headers (cookie session))))
+        "the session itself still works")))
+
+(deftest secrets-are-not-interchangeable
+  (let* ((c (gated-client)))
+    (ok (forbidden-p (visit c +gated-url+ :headers (cookie +token+)))
+        "the bootstrap token as a cookie, before the exchange")
+    (let ((session (login c)))
+      (ok (stringp session) "a failed cookie does not use the bootstrap token")
+      (ok (forbidden-p (visit c +gated-url+ :headers (cookie +token+)))
+          "the bootstrap token as a cookie, after the exchange")
+      (ok (forbidden-p (visit c (h:htmx-token-url +gated-url+ session)))
+          "the session secret as a bootstrap token")
+      (ok (forbidden-p (visit c (h:htmx-token-url +gated-url+ session) :headers (cookie session)))
+          "the session secret as a bootstrap token, with the cookie")
+      (let ((fresh (gated-client)))
+        (ok (forbidden-p (visit fresh (h:htmx-token-url +gated-url+ session)))
+            "another app's session secret as its bootstrap token")
+        (ok (forbidden-p (visit fresh +gated-url+ :headers (cookie session)))
+            "another app's session secret as its cookie")
+        (ok (stringp (login fresh)) "and its bootstrap token is still unused")))))
+
+(deftest gated-app-needs-a-secrets-backend
+  (let ((secrets-protocol:*secrets-backend* nil))
+    (ok (typep (gated-transport) 'hc:canvas-htmx-transport) "the transport needs none")
+    (ok (signals (gated-client) 'secrets-protocol:secrets-error)
+        "HTMX-APP makes the session secret: no CSPRNG, no app")
+    (ok (typep (h:htmx-app (canvas-transport) (gated-handlers)) 'function)
+        "an ungated app needs none")))
 
 (deftest one-time-url-location
   (flet ((location (query)
@@ -205,29 +284,34 @@
                                           (env :path +gated-url+
                                                :query (s+ "canvas-token=" +token+))))))
     (ok (= 303 (h:htmx-reply-status r)))
-    (ok (equal (s+ "canvas-token=" +token+ +cookie-attributes+ "; Secure") (hdr r "Set-Cookie"))))
-  (ok (equal (s+ "canvas-token=" +token+ +cookie-attributes+)
-             (hdr (visit (gated-client) (h:htmx-token-url +gated-url+ +token+)) "Set-Cookie"))
-      "plain http (loopback): no Secure"))
+    (ok (equal (s+ "canvas-token=" (set-cookie-value r) +cookie-attributes+ "; Secure")
+               (hdr r "Set-Cookie"))))
+  (let ((r (visit (gated-client) (h:htmx-token-url +gated-url+ +token+))))
+    (ok (equal (s+ "canvas-token=" (set-cookie-value r) +cookie-attributes+) (hdr r "Set-Cookie"))
+        "plain http (loopback): no Secure")))
 
 (deftest one-time-url-per-app
   (let* ((tx (gated-transport))
          (a (gated-client tx))
          (b (gated-client tx))
          (url (h:htmx-token-url +gated-url+ +token+)))
-    (ok (= 303 (h:htmx-reply-status (visit a url))))
-    (ok (= 303 (h:htmx-reply-status (visit b url))) "another app over the same transport")
-    (ok (forbidden-p (visit a url)))
-    (ok (forbidden-p (visit b url)))))
+    (let ((sa (set-cookie-value (visit a url)))
+          (sb (set-cookie-value (visit b url))))
+      (ok (stringp sa))
+      (ok (stringp sb) "another app over the same transport: its own exchange")
+      (ok (forbidden-p (visit a url)))
+      (ok (forbidden-p (visit b url)))
+      (ok (forbidden-p (visit b +gated-url+ :headers (cookie sa))) "a's cookie is not b's"))))
 
 (deftest token-name
   (let* ((c (gated-client (gated-transport :token-name "run-7")))
          (r (visit c (h:htmx-token-url +gated-url+ +token+ :token-name "run-7"))))
     (ok (equal "run-7" (h:htmx-transport-token-name (gated-transport :token-name "run-7"))))
     (ok (= 303 (h:htmx-reply-status r)))
-    (ok (equal (s+ "run-7=" +token+ +cookie-attributes+) (hdr r "Set-Cookie")))
-    (ok (= 200 (h:htmx-reply-status (visit c +gated-url+ :headers (cookie +token+ "run-7")))))
-    (ok (forbidden-p (visit c +gated-url+ :headers (cookie +token+))) "the default name is not it")
+    (ok (equal (s+ "run-7=" (set-cookie-value r "run-7") +cookie-attributes+) (hdr r "Set-Cookie")))
+    (let ((session (set-cookie-value r "run-7")))
+      (ok (= 200 (h:htmx-reply-status (visit c +gated-url+ :headers (cookie session "run-7")))))
+      (ok (forbidden-p (visit c +gated-url+ :headers (cookie session))) "the default name is not it"))
     (ok (forbidden-p (visit c (h:htmx-token-url +gated-url+ +token+)))
         "nor is the default field")))
 
@@ -235,25 +319,27 @@
   (let* ((open-tx (canvas-transport))
          (gated (gated-client open-tx :token +token+)))
     (ok (forbidden-p (visit gated +gated-url+)) "app :token on an open transport")
-    (ok (= 200 (h:htmx-reply-status (visit gated +gated-url+ :headers (cookie +token+))))))
+    (ok (= 200 (h:htmx-reply-status (visit gated +gated-url+ :headers (cookie (login gated)))))))
   (ok (= 200 (h:htmx-reply-status (visit (gated-client (gated-transport) :token nil) +gated-url+)))
       "app :token nil opens a gated transport")
-  (let ((c (gated-client (gated-transport) :token-name "app-1")))
-    (ok (= 200 (h:htmx-reply-status (visit c +gated-url+ :headers (cookie +token+ "app-1")))))
-    (ok (forbidden-p (visit c +gated-url+ :headers (cookie +token+))))))
+  (let* ((c (gated-client (gated-transport) :token-name "app-1"))
+         (session (login c :token-name "app-1")))
+    (ok (= 200 (h:htmx-reply-status (visit c +gated-url+ :headers (cookie session "app-1")))))
+    (ok (forbidden-p (visit c +gated-url+ :headers (cookie session))))))
 
 (deftest core-transport-gate
   (let* ((tx (transport :token +token+))
          (c (client :transport tx)))
     (ok (= 403 (h:htmx-reply-status (h:htmx-request c (m "GREET") '(:name "Ann")))))
     (ok (null (csp-of (h:htmx-request c (m "GREET") nil))) "the core sends no CSP by default")
-    (ok (equal "<p>Hello, Ann</p>"
-               (h:htmx-reply-body (h:htmx-request c (m "GREET") '(:name "Ann")
-                                                  :headers (cookie +token+)))))
-    (let ((r (h:htmx-request-url c (h:htmx-token-url (s+ +prefix+ "RPC-BACKEND-HTMX%2FTESTS::GREET")
-                                                     +token+))))
+    (let* ((r (h:htmx-request-url c (h:htmx-token-url (s+ +prefix+ "RPC-BACKEND-HTMX%2FTESTS::GREET")
+                                                      +token+)))
+           (session (set-cookie-value r)))
       (ok (= 303 (h:htmx-reply-status r)))
-      (ok (equal (s+ +prefix+ "RPC-BACKEND-HTMX%2FTESTS::GREET") (hdr r "Location"))))))
+      (ok (equal (s+ +prefix+ "RPC-BACKEND-HTMX%2FTESTS::GREET") (hdr r "Location")))
+      (ok (equal "<p>Hello, Ann</p>"
+                 (h:htmx-reply-body (h:htmx-request c (m "GREET") '(:name "Ann")
+                                                    :headers (cookie session))))))))
 
 (deftest gate-over-rpc-serve
   (let* ((tx (gated-transport))
@@ -262,7 +348,7 @@
          (c (h:make-htmx-client (http-server-protocol:server-app server)
                                 :codec (h:htmx-transport-codec tx))))
     (ok (forbidden-p (visit c +gated-url+)))
-    (ok (= 200 (h:htmx-reply-status (visit c +gated-url+ :headers (cookie +token+)))))))
+    (ok (= 200 (h:htmx-reply-status (visit c +gated-url+ :headers (cookie (login c))))))))
 
 (deftest jsonrpc-is-not-gated
   (ok (equal "<p>1</p>" (funcall (h:jsonrpc-handler (gated-transport) (gated-handlers))
