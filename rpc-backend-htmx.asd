@@ -1,15 +1,15 @@
 (defsystem "rpc-backend-htmx"
-  :version "0.1.0"
-  :description "htmx as an rpc-protocol transport + codec: Clack server, SSE streams, test client (H4h-1b)"
+  :version "0.2.0"
+  :description "htmx as an rpc-protocol transport + codec: Clack server, SSE streams, multipart uploads, test client (H4h-1b)"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "rpc-protocol" "0.2.0")
                (:version "http-server-protocol" "0.1.0")
-               (:version "http-protocol" "0.4.0")
+               (:version "http-protocol" "0.4.1")
                (:version "sse-protocol" "0.1.1")
                (:version "sse-backend-clack" "0.1.1")
                (:version "html-protocol" "0.1.1")
-               (:version "mime-protocol" "0.2.0")
+               (:version "mime-protocol" "0.3.0")
                (:version "encoding-protocol" "0.2.0")
                "quri")
   :serial t
@@ -23,12 +23,12 @@
   :in-order-to ((test-op (test-op "rpc-backend-htmx/tests"))))
 
 (defsystem "rpc-backend-htmx/canvas"
-  :version "0.1.0"
+  :version "0.2.0"
   :description "canvas-protocol resolver + page/asset routes for rpc-backend-htmx (H4h-1b)"
   :author "egao1980"
   :license "MIT"
   :depends-on ("rpc-backend-htmx"
-               (:version "canvas-protocol" "0.1.0"))
+               (:version "canvas-protocol" "0.2.0"))
   :pathname "src/canvas"
   :serial t
   :components ((:file "package")
@@ -56,7 +56,10 @@
                (:file "limit-test")
                (:file "client-test")
                (:file "parity-test")
-               (:file "canvas-test"))
+               (:file "canvas-test")
+               (:file "multipart-test")
+               (:file "upload-test")
+               (:file "page-keys-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

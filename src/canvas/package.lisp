@@ -3,6 +3,7 @@
   (:nicknames #:stack-rpc-htmx-canvas)
   (:export #:canvas-htmx-transport #:make-canvas-htmx-transport
            #:canvas-transport-asset-prefix #:canvas-transport-page-title
+           #:canvas-transport-page-keys
            #:htmx-resolver #:make-htmx-resolver #:htmx-resolver-handlers))
 
 (in-package #:rpc-backend-htmx/canvas)
