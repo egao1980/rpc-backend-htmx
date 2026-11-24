@@ -44,8 +44,7 @@
 ;;;   STACK-MIME:MIME-ENTITY that PARSE-MIME returned, not a copy and not
 ;;;   text. Its MIME-CONTENT-DISPOSITION and MIME-CONTENT-TYPE are
 ;;;   mime-protocol's parse of the part headers, taken as they are (a part
-;;;   without a Content-Type: mime-protocol#13; a browser's raw UTF-8 or
-;;;   backslash in a filename: mime-protocol#14; fixes there reach handlers
+;;;   without a Content-Type: mime-protocol#13; fixes there reach handlers
 ;;;   unchanged). MIME-CONTENT is the content octets exactly as sent (any
 ;;;   octet, CR LF and "--" included; a part with a Content-Transfer-Encoding
 ;;;   is decoded by mime-protocol, though browsers never send one, RFC 7578
@@ -55,9 +54,12 @@
 ;;; The body limit is unchanged: MAX-BODY-BYTES covers the whole body, files
 ;;; included (413 below); the body is parsed in memory. A per-field limit is the
 ;;; handler's (canvas-protocol COERCE-PARAM :file :max-size).
-;;; mime-protocol ≥ 0.3.0 is required: it keeps a part whose content is empty or
+;;; mime-protocol ≥ 0.3.1 is required: it keeps a part whose content is empty or
 ;;; ends in CR LF intact (mime-protocol#9), which is exactly an empty file input,
-;;; a textarea value ending in a line break, or a binary file.
+;;; a textarea value ending in a line break, or a binary file; and it reads a
+;;; form-data name and filename the way browsers write them (mime-protocol#14):
+;;; part headers as UTF-8 when their octets are valid UTF-8, a backslash
+;;; literal, %22 %0D %0A as " CR LF.
 ;;; - Body size: at most MAX-BODY-BYTES octets are ever read. A Content-Length
 ;;;   above the limit → HTMX-BODY-TOO-LARGE (:size = that length) before reading
 ;;;   anything; without Content-Length, read at most limit+1 octets and signal

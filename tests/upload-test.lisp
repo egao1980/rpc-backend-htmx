@@ -131,6 +131,36 @@
     (ok (equal (format nil "<p>T: s.svg image/svg+xml ~D; none</p>" (length (octets +svg+)))
                (h:htmx-reply-body r)))))
 
+(deftest upload-browser-filenames
+  ;; 0.2.1 (mime-protocol#14): the octets a browser sends for the upload form,
+  ;; a raw UTF-8 filename and a Windows path, read by COERCE-PARAM :file
+  ;; behind the canvas route.
+  (setf *uploaded* nil)
+  (let ((r (h:htmx-request-env
+            (upload-client)
+            (mp-env (list (mp-text "title" "Étude")
+                          (mp-file "score" +utf8-filename+ +svg+ "image/svg+xml")
+                          (mp-file "cover" "C:\\fakepath\\cöver.png" (bytes 1 2 3) "image/png"))
+                    :path (s+ "/canvas/" (m "UPLOAD-SCORE"))))))
+    (ok (= 200 (h:htmx-reply-status r)))
+    (ok (equal (format nil "<p>Étude: ~A image/svg+xml ~D; cöver.png image/png 3</p>"
+                       +utf8-filename+ (length (octets +svg+)))
+               (h:htmx-reply-body r)))
+    (destructuring-bind (score cover) *uploaded*
+      (ok (equal +utf8-filename+ (canvas:uploaded-file-filename score)))
+      (ok (equal "image/svg+xml" (canvas:uploaded-file-media-type score)))
+      (ok (equalp (octets +svg+) (canvas:uploaded-file-octets score)))
+      (ok (equal "cöver.png" (canvas:uploaded-file-filename cover))
+          "the backslash is kept, so canvas-protocol takes the last path segment")
+      (ok (equalp (bytes 1 2 3) (canvas:uploaded-file-octets cover)))))
+  ;; htmx-client sends the same name (filename plus filename*).
+  (setf *uploaded* nil)
+  (let ((r (post-files (m "UPLOAD-SCORE")
+                       (list :score (list :filename +utf8-filename+ :content (octets +svg+)
+                                          :content-type "image/svg+xml")))))
+    (ok (= 200 (h:htmx-reply-status r)))
+    (ok (equal +utf8-filename+ (canvas:uploaded-file-filename (first *uploaded*))))))
+
 (deftest upload-multiple-files
   (setf *uploaded* nil)
   (let ((r (post-files (m "UPLOAD-PICS")
