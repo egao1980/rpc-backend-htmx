@@ -23,6 +23,62 @@
 ;;; (HTMX-REQUEST-ENV client env) → HTMX-REPLY: calls the app on a hand-made env.
 ;;;   The app's response may be a list (status headers body) or a Clack
 ;;;   streaming function; drive it with SSE-BACKEND-CLACK:CALL-SSE-APP.
+;;;   Every request of the client goes through it (HTMX-REQUEST and
+;;;   HTMX-REQUEST-URL build their env, then call it), so the cookie jar and
+;;;   the client address below apply to all of them.
+;;;
+;;; Cookie jar and client address (0.5.0, #19 #15).
+;;; (MAKE-HTMX-CLIENT app &key codec prefix cookies remote-addr)
+;;;   COOKIES: NIL (default) — no jar: a Set-Cookie is not kept, and a request
+;;;     carries only the Cookie header its caller sends (0.4.0; the token gate
+;;;     tests send theirs by hand). T — the client keeps its own cookie jar, as
+;;;     a browser does: every reply's Set-Cookie headers go in, every request
+;;;     carries the cookies that apply, so a test walks a multi-request flow
+;;;     (the gate's exchange, then a session across pages).
+;;;   REMOTE-ADDR: NIL (default) — each env keeps the :REMOTE-ADDR it has
+;;;     ("127.0.0.1" from the codec's env builder; a hand-made env its own). A
+;;;     non-empty string — every env the client sends gets that :REMOTE-ADDR:
+;;;     a browser at that address, or the proxy in front of the app (then
+;;;     X-Forwarded-For goes in :HEADERS).
+;;;   Anything else → TYPE-ERROR (CHECK-TYPE). Readers:
+;;;   HTMX-CLIENT-REMOTE-ADDR → NIL or that string.
+;;;   (HTMX-CLIENT-COOKIES client) → NIL without a jar; else a fresh alist
+;;;     ((name . value) …) of the cookies the jar holds, in the order they were
+;;;     last set, expired ones left out.
+;;;   (HTMX-CLIENT-COOKIE client name) → the value of the jar's cookie NAME
+;;;     (STRING=), or NIL (no jar, no such cookie).
+;;; With a jar or a REMOTE-ADDR, HTMX-REQUEST-ENV wraps the call of the app:
+;;;   1. Out. The jar's cookies for the request — (CL-COOKIE:COOKIE-JAR-HOST-COOKIES
+;;;      jar host path :securep s), HOST the env's :SERVER-NAME ("localhost"
+;;;      when absent), PATH its :PATH-INFO, S true when its :URL-SCHEME is
+;;;      "https" (STRING-EQUAL), so a Secure cookie never goes over http — are
+;;;      sent as one "cookie" header, (CL-COOKIE:WRITE-COOKIE-HEADER cookies):
+;;;      "a=1; b=2", in jar order. None → no Cookie header from the jar. An
+;;;      explicit Cookie header (HTMX-REQUEST :headers, or one in a hand-made
+;;;      env's :HEADERS) replaces the jar's for that request. With REMOTE-ADDR
+;;;      the env's :REMOTE-ADDR is that string. The caller's env and its
+;;;      :HEADERS table are not modified: the client calls the app with a new
+;;;      plist whose first keys are :HEADERS (a fresh table: the env's entries
+;;;      plus the jar's "cookie") and :REMOTE-ADDR, followed by the env (GETF
+;;;      finds the new keys first).
+;;;   2. The app is called as before (CALL-SSE-APP: a streamed reply's head
+;;;      counts like a list reply's headers).
+;;;   3. In. Each "set-cookie" header of the reply, in order, is read with
+;;;      (CL-COOKIE:PARSE-SET-COOKIE-HEADER value host path), HOST and PATH as
+;;;      in 1, and merged into the jar (CL-COOKIE:MERGE-COOKIES: a cookie of
+;;;      the same name, host or domain, and path replaces the one held). A
+;;;      cookie whose Max-Age is 0 or less is removed at once (RFC 6265 §5.3
+;;;      step 3: the earliest expiry; cl-cookie's EXPIRED-COOKIE-P keeps a
+;;;      Max-Age=0 cookie for up to a second). Cookies expire by the real
+;;;      clock (cl-cookie), never by a server's injected one: a test that
+;;;      moves a session manager's clock past the idle TTL still sends the old
+;;;      cookie, as a browser whose clock disagrees would. A Set-Cookie
+;;;      cl-cookie cannot read signals cl-cookie's own error (the apps under
+;;;      test never send one).
+;;;   The jar is per client and not synchronized: one client is one browser,
+;;;   driven by one thread. The stack has no cookie-jar protocol, so the jar is
+;;;   cl-cookie's (the one dexador uses); session-protocol writes its
+;;;   Set-Cookie with cl-cookie too.
 ;;;
 ;;; HTMX-REPLY:
 ;;;   status (integer); headers: alist of (lowercase name . value) in response
@@ -45,16 +101,58 @@
 
 (defclass htmx-client (rpc-protocol:rpc-transport)
   ((app :initarg :app :reader htmx-client-app)
-   (codec :initarg :codec :reader htmx-client-codec))
+   (codec :initarg :codec :reader htmx-client-codec)
+   (jar :initarg :jar :initform nil :reader %client-jar
+        :documentation "NIL or this client's CL-COOKIE:COOKIE-JAR (0.5.0).")
+   (remote-addr :initarg :remote-addr :initform nil :reader htmx-client-remote-addr
+                :documentation "NIL or the :REMOTE-ADDR of every env this client sends (0.5.0)."))
   (:documentation "In-process browser stand-in for a Clack app."))
 
-(defun make-htmx-client (app &key (codec nil codec-p) (prefix "/"))
+(defun %remote-addr-p (object)
+  "True for a non-empty string."
+  (and (stringp object) (plusp (length object))))
+
+(defun make-htmx-client (app &key (codec nil codec-p) (prefix "/") cookies remote-addr)
   "Client for the Clack APP. CODEC defaults to (make-htmx-codec :prefix PREFIX);
-pass the server transport's codec to share its prefix."
+pass the server transport's codec to share its prefix. COOKIES T keeps a cookie
+jar; REMOTE-ADDR a string sets every env's :REMOTE-ADDR (file header)."
   (check-type app function)
+  (check-type cookies boolean)
+  (check-type remote-addr (or null (satisfies %remote-addr-p)) "NIL or a non-empty string")
   (make-instance 'htmx-client
                  :app app
-                 :codec (if (and codec-p codec) codec (make-htmx-codec :prefix prefix))))
+                 :codec (if (and codec-p codec) codec (make-htmx-codec :prefix prefix))
+                 :jar (and cookies (cl-cookie:make-cookie-jar))
+                 :remote-addr remote-addr))
+
+(defun htmx-client-cookies (client)
+  "NIL without a jar, else a fresh alist of the cookies CLIENT's jar holds (file
+header, Cookie jar)."
+  (if (%client-jar client)
+      (%s1-pending "HTMX-CLIENT-COOKIES (the cookie jar)")
+      nil))
+
+(defun htmx-client-cookie (client name)
+  "The value of CLIENT's jar cookie NAME, or NIL (file header, Cookie jar)."
+  (if (%client-jar client)
+      (%s1-pending "HTMX-CLIENT-COOKIE (the cookie jar)")
+      (progn (check-type name string) nil)))
+
+(defun %client-env (client env)
+  "ENV as CLIENT sends it: the jar's Cookie and the client's :REMOTE-ADDR in
+front (file header, Cookie jar, step 1); ENV itself without a jar and an address."
+  ;; S1 contract stub: a 0.4.0 client (no jar, no address) is unchanged.
+  (if (or (%client-jar client) (htmx-client-remote-addr client))
+      (%s1-pending "the cookie jar and :REMOTE-ADDR of HTMX-CLIENT")
+      env))
+
+(defun %keep-cookies (client env headers)
+  "Merge the Set-Cookie entries of the reply HEADERS (a Clack plist) into
+CLIENT's jar, ENV the request's (file header, Cookie jar, step 3)."
+  (declare (ignore env headers))
+  ;; S1 contract stub: nothing to keep without a jar.
+  (when (%client-jar client)
+    (%s1-pending "the cookie jar of HTMX-CLIENT")))
 
 (defclass htmx-reply ()
   ((status :initarg :status :reader htmx-reply-status)
@@ -87,11 +185,13 @@ pass the server transport's codec to share its prefix."
         collect (cons (string-downcase (string name)) value)))
 
 (defun htmx-request-env (client env)
-  (destructuring-bind (status headers body)
-      (sse-backend-clack:call-sse-app (htmx-client-app client) env)
-    (make-instance 'htmx-reply :status status
-                               :headers (%header-alist headers)
-                               :body (or body ""))))
+  (let ((sent (%client-env client env)))
+    (destructuring-bind (status headers body)
+        (sse-backend-clack:call-sse-app (htmx-client-app client) sent)
+      (%keep-cookies client sent headers)
+      (make-instance 'htmx-reply :status status
+                                 :headers (%header-alist headers)
+                                 :body (or body "")))))
 
 (defun %client-metadata (hx-request target trigger trigger-name current-url boosted)
   (append (when hx-request (list :request t))

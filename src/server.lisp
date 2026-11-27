@@ -2,23 +2,74 @@
 
 ;;; Server transport: a Clack app (http-server-protocol's app contract).
 ;;;
-;;; (HTMX-APP transport handler &key stream-handler csp token token-name)
+;;; (HTMX-APP transport handler &key stream-handler csp token token-name sessions)
 ;;;   → (lambda (env) → response)
 ;;;   HANDLER: an HTMX-HANDLERS table, a function (method params) → (values result
 ;;;   response-headers) as rpc-protocol's BACKEND-RPC-SERVE takes, or NIL.
 ;;;   STREAM-HANDLER: a function (mode method params stream), as
 ;;;   BACKEND-RPC-SERVE-STREAM takes, or NIL.
-;;;   CSP, TOKEN, TOKEN-NAME (0.3.0, #4): when supplied (NIL included) they
-;;;   replace the transport's (HTMX-TRANSPORT-CSP …) for this app, validated as
-;;;   MAKE-HTMX-TRANSPORT validates them (TYPE-ERROR when HTMX-APP is called).
+;;;   CSP, TOKEN, TOKEN-NAME (0.3.0, #4), SESSIONS (0.5.0, #19): when supplied
+;;;   (NIL included) they replace the transport's (HTMX-TRANSPORT-CSP …) for
+;;;   this app, validated as MAKE-HTMX-TRANSPORT validates them (TYPE-ERROR when
+;;;   HTMX-APP is called). SESSIONS T makes a fresh session manager for this
+;;;   app; not supplied, the app uses the transport's manager (Sessions, below).
 ;;;   Per request the app (1) runs the token gate when a token is in force
-;;;   (Token gate, below); (2) calls (HTMX-HANDLE-REQUEST transport handler
-;;;   stream-handler env) when the gate lets the request through; (3) adds the
-;;;   CSP header to whatever (1) or (2) answered (Content-Security-Policy,
-;;;   below). HTMX-HANDLE-REQUEST called directly does neither: both belong to
-;;;   the app, so they cover the canvas asset route and the canvas :around too.
-;;;   With no token and no CSP in force, (1) and (3) change nothing: the app
-;;;   answers what HTMX-HANDLE-REQUEST answers, as in 0.2.1.
+;;;   (Token gate, below); (2) when the gate lets the request through, runs the
+;;;   session layer when sessions are in force (session.lisp), which calls
+;;;   (3) (HTMX-HANDLE-REQUEST transport handler stream-handler env), or calls
+;;;   (3) directly when sessions are off; (4) adds the CSP header to whatever
+;;;   (1), (2) or (3) answered (Content-Security-Policy, below).
+;;;   HTMX-HANDLE-REQUEST called directly does none of (1), (2) and (4): they
+;;;   belong to the app, so they cover the canvas asset route and the canvas
+;;;   :around too. With no token, no sessions and no CSP in force, (1), (2) and
+;;;   (4) change nothing: the app answers what HTMX-HANDLE-REQUEST answers, as
+;;;   in 0.2.1.
+;;;   Order (0.5.0, locked): CSP outermost, then the gate, then sessions, then
+;;;   HTMX-HANDLE-REQUEST. The gate stays FIRST, so an unauthenticated request
+;;;   never begins a session, never reaches the store and never has its body
+;;;   read; the CSP header is on every response, the gate's 303 and 403, the
+;;;   cross-origin 403 and every response that sets a session cookie included
+;;;   (the CSP stays the last header, after the session's Set-Cookie). The gate
+;;;   and the CSP stay the closures of 0.3.0 here; rpc-backend-htmx#20 moves
+;;;   them into middleware-protocol mixins later, in the same order.
+;;;
+;;; Sessions (0.5.0, #19). SESSIONS, the option of MAKE-HTMX-TRANSPORT,
+;;; MAKE-CANVAS-HTMX-TRANSPORT and HTMX-APP, is:
+;;;   NIL (default) — no sessions: no session layer is built, no session code
+;;;     runs, HTMX-SESSION is NIL in every handler, no cross-origin check runs,
+;;;     and every response is byte-identical to 0.4.0.
+;;;   T — a fresh (STACK-SESSION:MAKE-SESSION-MANAGER): its store a
+;;;     CACHE-SESSION-STORE over a fresh STACK-CACHE:IN-MEMORY-TTL-CACHE,
+;;;     session-protocol's defaults (cookie "sid", SameSite=Lax, HttpOnly,
+;;;     Path=/, Secure on https; idle TTL one day). Made ONCE, by
+;;;     MAKE-HTMX-TRANSPORT for the transport (every app built from it shares
+;;;     that manager and its store) or by HTMX-APP for that app. Process-local:
+;;;     gone on restart, not shared between processes.
+;;;   a STACK-SESSION:SESSION-MANAGER — used as given (a Redis-backed store, a
+;;;     cookie policy, the lifetimes, an injected clock).
+;;;   Anything else → TYPE-ERROR (CHECK-TYPE). There is no plist form: a
+;;;   manager is one MAKE-SESSION-MANAGER call, which checks its own arguments.
+;;;   HTMX-TRANSPORT-SESSIONS → NIL or the transport's SESSION-MANAGER.
+;;; With sessions in force HTMX-APP builds the session layer once (session.lisp:
+;;; S0b's SESSION-HANDLER on middleware-protocol), checking first, in order:
+;;;   a. when a token is also in force, the session cookie's name
+;;;      (STACK-SESSION:COOKIE-POLICY-NAME of the manager's cookie policy) must
+;;;      differ (STRING=) from the gate's TOKEN-NAME, else HTMX-ERROR (status
+;;;      500) whose message is exactly
+;;;        Session cookie name <name> is the token gate's cookie name
+;;;      (the two cookies coexist in one browser: the gate's holds the run's
+;;;      secret, SameSite=Strict, the session's the visitor's id, SameSite=Lax);
+;;;   b. the backends a session needs are installed: it calls
+;;;        (STACK-SESSION:ENCODE-SESSION-RECORD
+;;;         (STACK-SESSION:MAKE-SESSION :id (STACK-SESSION:GENERATE-SESSION-ID)
+;;;                                     :created-at 0 :last-seen 0))
+;;;      once, so a missing secrets backend (session ids) signals
+;;;      SECRETS-PROTOCOL:SECRETS-ERROR and a missing json-protocol backend (the
+;;;      stored record) signals JSON-PROTOCOL:JSON-ERROR here, never at a
+;;;      visitor's request, as the gate's session secret does (Token gate).
+;;;      rpc-backend-htmx depends on the protocols, not on backends: the
+;;;      application loads them (crypto-backend-ironclad, json-backend-jzon).
+;;; BACKEND-RPC-SERVE / BACKEND-RPC-SERVE-STREAM serve the transport's sessions.
 ;;;
 ;;; HTMX-HANDLE-REQUEST (default method), per request:
 ;;; 1. Decode ENV with the transport's codec. Any condition → step 5.
@@ -95,12 +146,15 @@
 ;;;   BACKEND-RPC-SERVE-STREAM (htmx-transport handler &key host port backend)
 ;;;   → the same with HANDLER as the stream handler and no unary handler.
 ;;;   Defaults: host "127.0.0.1", port 8080, backend HTTP-SERVER-PROTOCOL:*HTTP-SERVER-BACKEND*.
-;;;   Both serve the transport's CSP and token (they call HTMX-APP without overrides).
+;;;   Both serve the transport's CSP, token and sessions (they call HTMX-APP
+;;;   without overrides).
 ;;;
-;;; MAKE-HTMX-TRANSPORT &key prefix max-body-bytes max-params error-target
-;;;   error-swap csp token token-name. MAX-PARAMS (0.3.0) goes to the codec
-;;;   (codec.lisp, Params). CSP, TOKEN, TOKEN-NAME below; readers
-;;;   HTMX-TRANSPORT-CSP, HTMX-TRANSPORT-TOKEN, HTMX-TRANSPORT-TOKEN-NAME.
+;;; MAKE-HTMX-TRANSPORT &key prefix max-body-bytes max-params trusted-proxies
+;;;   error-target error-swap csp token token-name sessions. MAX-PARAMS (0.3.0)
+;;;   and TRUSTED-PROXIES (0.5.0, #15) go to the codec (codec.lisp, Params and
+;;;   Client address). CSP, TOKEN, TOKEN-NAME below; SESSIONS above; readers
+;;;   HTMX-TRANSPORT-CSP, HTMX-TRANSPORT-TOKEN, HTMX-TRANSPORT-TOKEN-NAME,
+;;;   HTMX-TRANSPORT-SESSIONS.
 ;;;
 ;;; Content-Security-Policy (0.3.0, rpc-backend-htmx#4). CSP is:
 ;;;   NIL (the default of MAKE-HTMX-TRANSPORT) — no header: the core serves
@@ -118,7 +172,9 @@
 ;;; the LAST header of every response it returns, whatever produced it:
 ;;; fragments, full pages, 204s, every error status (400 403 404 405 406 413
 ;;; 415 422 500, the fallback 500), the gate's 303 and 403, asset responses
-;;; (octet bodies), and streams. A Clack streaming response (a function of a
+;;; (octet bodies), and streams; 0.5.0: the cross-origin 403 and every
+;;; response the session layer gave a Set-Cookie (the CSP after it, still
+;;; last). A Clack streaming response (a function of a
 ;;; responder) is wrapped so the (status headers) it hands its responder gets
 ;;; the header the same way; the events are untouched. Exactly one such header
 ;;; per response; bodies are never changed.
@@ -209,7 +265,9 @@
 ;;; JSONRPC-HANDLER (transport handlers) → (lambda (method params) → string), for
 ;;;   any JSON-RPC server (rpc-backend-http MAKE-RPC-APP, …). Same table, same
 ;;;   functions, same fragments: the result is the exact body string the htmx
-;;;   :call-response would send (a fragment; never a full page). PARAMS: NIL, an
+;;;   :call-response would send (a fragment; never a full page). No session
+;;;   (0.5.0): HTMX-SESSION is NIL there, and the message has no client address.
+;;;   PARAMS: NIL, an
 ;;;   empty vector or a JSON object (hash table, string keys); values strings or
 ;;;   integers (→ decimal); anything else → RPC-INVALID-PARAMS. Unknown method or
 ;;;   a :call-stream entry → RPC-METHOD-NOT-FOUND. A :notify entry → "".
@@ -260,9 +318,12 @@
           :documentation "NIL or the per-run token as an HTTP-PROTOCOL:SECRET (0.3.0, #4).")
    (token-name :initarg :token-name :initform +default-token-name+
                :reader htmx-transport-token-name
-               :documentation "Cookie name and one-time URL field of the token gate."))
+               :documentation "Cookie name and one-time URL field of the token gate.")
+   (sessions :initarg :sessions :initform nil :reader htmx-transport-sessions
+             :documentation "NIL or the STACK-SESSION:SESSION-MANAGER of the transport's
+apps (0.5.0, #19)."))
   (:documentation "htmx server transport: an HTMX-CODEC, error-fragment placement, and
-the app's CSP and token gate. See the file header."))
+the app's CSP, token gate and sessions. See the file header."))
 
 ;;; Option validation (0.3.0). Each returns the value to store or signals
 ;;; TYPE-ERROR (CHECK-TYPE, so STORE-VALUE is offered). File header,
@@ -319,22 +380,35 @@ characters of [A-Za-z0-9_-]."
         ((eq csp t) +default-csp+)
         (t (%csp-option csp))))
 
+(defun %sessions-option (sessions)
+  "SESSIONS (NIL, T or a STACK-SESSION:SESSION-MANAGER) → NIL or a manager; T
+makes a fresh one with session-protocol's defaults. Else TYPE-ERROR. File
+header, Sessions."
+  (check-type sessions (or null (eql t) stack-session:session-manager)
+              "NIL, T or a STACK-SESSION:SESSION-MANAGER")
+  (if (eq sessions t)
+      (stack-session:make-session-manager)
+      sessions))
+
 (defun make-htmx-transport (&key (prefix "/") (max-body-bytes +default-max-body-bytes+)
-                              (max-params +default-max-params+)
+                              (max-params +default-max-params+) trusted-proxies
                               (error-target +error-fragment-target+)
                               (error-swap +error-fragment-swap+)
-                              csp token (token-name +default-token-name+))
+                              csp token (token-name +default-token-name+)
+                              sessions)
   "An HTMX-TRANSPORT. See the file header (MAKE-HTMX-TRANSPORT)."
   (make-instance 'htmx-transport
                  :codec (make-htmx-codec :prefix prefix :max-body-bytes max-body-bytes
-                                         :max-params max-params)
+                                         :max-params max-params
+                                         :trusted-proxies trusted-proxies)
                  :error-target error-target
                  :error-swap error-swap
                  :csp (%transport-csp csp)
                  :token (and token (%token-option token))
                  :token-name (if (equal token-name +default-token-name+)
                                  token-name
-                                 (%token-name-option token-name))))
+                                 (%token-name-option token-name))
+                 :sessions (%sessions-option sessions)))
 
 (defun htmx-token-url (url token &key (token-name +default-token-name+))
   "URL with \"<token-name>=<token>\" appended: the one-time URL of the token gate.
@@ -365,11 +439,11 @@ See the file header (Token gate)."
 (defgeneric htmx-error-response (transport condition)
   (:documentation "Clack response for CONDITION (status + error fragment + HX headers)."))
 
-;;; App wrapping (0.3.0). File header, HTMX-APP, Content-Security-Policy and
-;;; Token gate. HTMX-APP composes three layers once, leaving out a layer that
-;;; is off: CSP outermost (so the gate's 303 / 403 carry it too), then the
-;;; gate, then HTMX-HANDLE-REQUEST. With neither in force the app is 0.2.1's
-;;; closure itself.
+;;; App wrapping (0.3.0, 0.5.0). File header, HTMX-APP, Content-Security-Policy,
+;;; Token gate and Sessions. HTMX-APP composes four layers once, leaving out a
+;;; layer that is off: CSP outermost (so the gate's 303 / 403 carry it too),
+;;; then the gate, then the session layer (%SESSION-LAYER, session.lisp), then
+;;; HTMX-HANDLE-REQUEST. With none in force the app is 0.2.1's closure itself.
 
 (defstruct (%gate (:constructor %make-gate (session)) (:copier nil) (:predicate nil))
   ;; One app's token gate state (file header, Token gate: state is per app).
@@ -513,10 +587,11 @@ SECRETS-PROTOCOL:SECRETS-ERROR here, not at a login) and an unused bootstrap."
 
 (defun htmx-app (transport handler &key stream-handler
                                      (csp nil csp-p) (token nil token-p)
-                                     (token-name nil token-name-p))
-  "Clack app serving HANDLER / STREAM-HANDLER through TRANSPORT, with its CSP and
-token gate (CSP, TOKEN, TOKEN-NAME override the transport's when supplied). See
-the file header."
+                                     (token-name nil token-name-p)
+                                     (sessions nil sessions-p))
+  "Clack app serving HANDLER / STREAM-HANDLER through TRANSPORT, with its CSP,
+token gate and sessions (CSP, TOKEN, TOKEN-NAME, SESSIONS override the
+transport's when supplied). See the file header."
   (check-type transport htmx-transport)
   (check-type handler (or htmx-handlers function null))
   (check-type stream-handler (or function null))
@@ -526,8 +601,12 @@ the file header."
                        (htmx-transport-token transport)))
         (name (if token-name-p
                   (%token-name-option token-name)
-                  (htmx-transport-token-name transport))))
-    (%csp-layer (%gate-layer (%handler-app transport handler stream-handler)
+                  (htmx-transport-token-name transport)))
+        (manager (if sessions-p
+                     (%sessions-option sessions)
+                     (htmx-transport-sessions transport))))
+    (%csp-layer (%gate-layer (%session-layer (%handler-app transport handler stream-handler)
+                                             transport manager (and bootstrap name))
                              transport bootstrap name)
                 policy)))
 
