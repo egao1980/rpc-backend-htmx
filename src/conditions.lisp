@@ -14,6 +14,11 @@
 ;;; gate: server.lisp). Their slots and reports are final; each is signalled
 ;;; where it is detected (%ACCEPT-PARAMS, %CHECK-PARAM-COUNT / %JSON-PAIRS, the
 ;;; token gate).
+;;;
+;;; 0.5.0 adds HTMX-CROSS-ORIGIN (403, a subclass of HTMX-FORBIDDEN): with
+;;; sessions in force, an unsafe request that a browser sent from another
+;;; origin (session.lisp, Cross-origin requests). Slots and report are final
+;;; (given in the S1 contract).
 
 (define-condition htmx-error (rpc-protocol:rpc-error)
   ((status :initarg :status :initform 500 :reader htmx-error-status
@@ -41,6 +46,13 @@
                      :message "Forbidden")
   (:documentation "The token gate refused the request (#4): no valid session cookie, a
 wrong or already used bootstrap token. server.lisp, Token gate."))
+
+(define-condition htmx-cross-origin (htmx-forbidden) ()
+  (:default-initargs :message "Cross-origin request")
+  (:documentation "With sessions in force, an unsafe request (not GET, HEAD or OPTIONS) that
+a browser sent from another origin (0.5.0, #19): 403 before any session is begun
+or any body read. session.lisp, Cross-origin requests. Its report is
+\"htmx error 403: Cross-origin request\"; it never echoes a header value."))
 
 (define-condition htmx-method-not-allowed (htmx-error) ()
   (:default-initargs :status 405 :code rpc-protocol:+invalid-request+

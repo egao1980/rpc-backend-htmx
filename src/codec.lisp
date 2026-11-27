@@ -94,8 +94,64 @@
 ;;;   names) per +REQUEST-METADATA-HEADERS+, as a plist in that order holding only
 ;;;   the headers present. :REQUEST and :BOOSTED are T when the value is "true"
 ;;;   (case-insensitive) and omitted otherwise; the rest are the header strings.
+;;;   0.5.0 (#15) appends ("last-event-id" . :last-event-id): the Last-Event-ID
+;;;   header, as the string sent, under :LAST-EVENT-ID, last. A browser's
+;;;   EventSource sends it when it reconnects to a stream whose events had ids
+;;;   (STACK-SSE:SSE-EVENT :id), so a :call-stream handler resumes after the
+;;;   last event it sent instead of starting over. Any request that carries the
+;;;   header gets it; a request without it has no :LAST-EVENT-ID, so every 0.4.0
+;;;   metadata plist is unchanged.
 ;;; - Mode: :CALL-STREAM when the Accept header contains "text/event-stream",
 ;;;   else :CALL-RESPONSE. (:NOTIFY is a handler-table mode, not a wire one.)
+;;; - Client address (0.5.0, #15): HTMX-MESSAGE-CLIENT-ADDRESS, below.
+;;; - Session (0.5.0, #19): HTMX-MESSAGE-SESSION is (STACK-SESSION:ENV-SESSION
+;;;   env), the session S0b's SESSION-HANDLER put under :SESSION, or NIL (no
+;;;   session layer: server.lisp and session.lisp).
+;;;
+;;; Client address (0.5.0, rpc-backend-htmx#15). HTMX-MESSAGE-CLIENT-ADDRESS is
+;;; the address of the client that sent the request, for a per-client limit
+;;; ("at most N running jobs per client") or a log line. MAKE-HTMX-CODEC
+;;; &key trusted-proxies (MAKE-HTMX-TRANSPORT and MAKE-CANVAS-HTMX-TRANSPORT
+;;; pass it on):
+;;;   NIL (default) — no proxy is trusted: the address is ENV :REMOTE-ADDR as
+;;;     the server gave it (a string), or NIL when the env has none. The
+;;;     X-Forwarded-For header is never read, so a client cannot choose its own
+;;;     address by sending one (spoofing).
+;;;   a non-empty proper list of strings, each an address or a CIDR network
+;;;     that STACK-IP:PARSE-NETWORK reads ("10.0.0.0/8", "127.0.0.1", "::1",
+;;;     "fd00::/8"; an address alone is a /32 or /128) — the networks of the
+;;;     reverse proxies in front of the app. Anything else (a lone string, a
+;;;     string ip-protocol refuses, a non-string, an improper list) →
+;;;     TYPE-ERROR (CHECK-TYPE) at construction. HTMX-CODEC-TRUSTED-PROXIES →
+;;;     NIL or a fresh list of the strings as given.
+;;;   An address is TRUSTED when STACK-IP:PARSE-IP reads it and some trusted
+;;;   network contains it (STACK-IP:IP-CONTAINS-P); a string ip-protocol
+;;;   cannot read is never trusted. With trusted proxies the address is found
+;;;   by walking from the right, nginx's real_ip_recursive:
+;;;     1. A := ENV :REMOTE-ADDR (the peer of this connection). Not a string,
+;;;        or not trusted → A, and X-Forwarded-For is not read: a client that
+;;;        reaches the app directly cannot spoof its address.
+;;;     2. HOPS := the "x-forwarded-for" header split at commas (as the server
+;;;        hands it: several header lines arrive joined with commas), each hop
+;;;        trimmed of spaces and tabs, empty hops dropped, kept in order.
+;;;     3. While A is trusted and HOPS is not empty: H := the last (right-most)
+;;;        hop, removed from HOPS. H not an address STACK-IP:PARSE-IP reads
+;;;        ("unknown", "1.2.3.4:5678", "[::1]", junk) → the walk stops and the
+;;;        result is A: an address is never taken from beyond a hop no
+;;;        trusted proxy could have written. Else A := H.
+;;;     4. → A, the string as it appeared (trimmed; not re-printed by
+;;;        ip-protocol): the right-most untrusted hop, or, when every hop is
+;;;        trusted, the left-most one, or the proxy itself when there is no
+;;;        X-Forwarded-For.
+;;;   Hops left of the right-most untrusted one were written by the client and
+;;;   are ignored. The RFC 7239 Forwarded header and X-Real-IP are not read;
+;;;   X-Forwarded-Proto is not read either (behind a TLS-terminating proxy, a
+;;;   session cookie needs a cookie policy with :secure t, session-protocol's
+;;;   cookie.lisp). ip-protocol 0.1.0 has no IPv4-mapped IPv6 ("::ffff:1.2.3.4").
+;;;   One internal function computes it, %CLIENT-ADDRESS (codec env), called by
+;;;   DECODE-MESSAGE-USING-CODEC.
+;;;   JSONRPC-HANDLER's message has no client address (NIL): the JSON-RPC
+;;;   server's own request is not an htmx env.
 ;;;
 ;;; ENCODE-REQUEST-USING-CODEC (codec method params &key id http-method encoding
 ;;;                             metadata headers) → a Clack env plist, what a
@@ -188,8 +244,10 @@
     ("hx-trigger" . :trigger)
     ("hx-trigger-name" . :trigger-name)
     ("hx-current-url" . :current-url)
-    ("hx-boosted" . :boosted))
-  "Request header (lowercase) → metadata key, in metadata order.")
+    ("hx-boosted" . :boosted)
+    ("last-event-id" . :last-event-id))
+  "Request header (lowercase) → metadata key, in metadata order. 0.5.0 (#15)
+appends Last-Event-ID (file header, Metadata).")
 
 (defparameter +error-fragment-target+ "#canvas-error"
   "Default HX-Retarget of an error response.")
@@ -204,18 +262,53 @@
                    :reader htmx-codec-max-body-bytes)
    (max-params :initarg :max-params :initform +default-max-params+
                :reader htmx-codec-max-params
-               :documentation "Most fields one request may carry (0.3.0, #2)."))
+               :documentation "Most fields one request may carry (0.3.0, #2).")
+   (trusted-proxies :initarg :trusted-proxies :initform nil
+                    :documentation "NIL or the strings as given (0.5.0, #15); read with
+HTMX-CODEC-TRUSTED-PROXIES.")
+   (trusted-networks :initarg :trusted-networks :initform nil
+                     :reader %codec-trusted-networks
+                     :documentation "The STACK-IP:IP-NETWORK of each trusted proxy string."))
   (:documentation "htmx requests ↔ rpc messages; fragments ↔ responses."))
 
+(defun %trusted-proxy-string-p (object)
+  "True for a string STACK-IP:PARSE-NETWORK reads (file header, Client address)."
+  (and (stringp object)
+       ;; Translate only: ip-protocol's refusal is the option's TYPE-ERROR.
+       (handler-case (and (stack-ip:parse-network object) t)
+         (stack-ip:ip-error () nil))))
+
+(defun %trusted-proxies-p (object)
+  "True for a non-empty proper list of trusted-proxy strings."
+  (and (consp object)
+       (null (cdr (last object)))
+       (every #'%trusted-proxy-string-p object)))
+
+(defun %trusted-proxies-option (trusted-proxies)
+  "TRUSTED-PROXIES (NIL or a list of address / CIDR strings) → itself, or
+TYPE-ERROR (CHECK-TYPE). File header, Client address."
+  (check-type trusted-proxies (or null (satisfies %trusted-proxies-p))
+              "NIL or a non-empty proper list of IP address or CIDR network strings")
+  trusted-proxies)
+
 (defun make-htmx-codec (&key (prefix "/") (max-body-bytes +default-max-body-bytes+)
-                          (max-params +default-max-params+))
+                          (max-params +default-max-params+) trusted-proxies)
   "PREFIX a string starting and ending with /; MAX-BODY-BYTES and MAX-PARAMS
-non-negative integers (else TYPE-ERROR)."
+non-negative integers; TRUSTED-PROXIES NIL or a list of address / CIDR strings
+(file header, Client address). Else TYPE-ERROR."
   (check-type prefix (and string (satisfies %slash-bounded-p)))
   (check-type max-body-bytes (integer 0))
   (check-type max-params (integer 0))
-  (make-instance 'htmx-codec :prefix prefix :max-body-bytes max-body-bytes
-                             :max-params max-params))
+  (let ((proxies (copy-list (%trusted-proxies-option trusted-proxies))))
+    (make-instance 'htmx-codec :prefix prefix :max-body-bytes max-body-bytes
+                               :max-params max-params
+                               :trusted-proxies proxies
+                               :trusted-networks (mapcar #'stack-ip:parse-network proxies))))
+
+(defun htmx-codec-trusted-proxies (codec)
+  "NIL or a fresh list of CODEC's trusted-proxy strings, as given (file header,
+Client address)."
+  (copy-list (slot-value codec 'trusted-proxies)))
 
 (defun %slash-bounded-p (string)
   "True for a non-empty string that starts and ends with /."
@@ -238,7 +331,14 @@ in wire order. See the file header (Params).")
    (mode :initarg :mode :initform :call-response :reader htmx-message-mode
          :documentation ":CALL-RESPONSE or :CALL-STREAM (from Accept).")
    (http-method :initarg :http-method :initform :get :reader htmx-message-http-method
-                :documentation ":GET or :POST."))
+                :documentation ":GET or :POST.")
+   (client-address :initarg :client-address :initform nil
+                   :reader htmx-message-client-address
+                   :documentation "The client's address, a string, or NIL (0.5.0, #15). See
+the file header (Client address).")
+   (session :initarg :session :initform nil :reader htmx-message-session
+            :documentation "The request's STACK-SESSION:SESSION, or NIL when no session
+layer ran (0.5.0, #19). Handlers use HTMX-SESSION (session.lisp)."))
   (:documentation "One decoded htmx request."))
 
 
@@ -491,6 +591,57 @@ keyword (%KEY-PAIRS). Nothing is interned. See the file header (Params)."
         :call-stream
         :call-response)))
 
+;;; Client address (0.5.0, #15): file header, Client address.
+
+;;; Its own NOTINLINE function, its value used through a plain call: the
+;;; HANDLER-CASE never sits inside an OR or a LET test (the ECL 26.5.5 shapes,
+;;; server.lisp).
+(declaim (notinline %ip-address-or-nil))
+(defun %ip-address-or-nil (object)
+  "OBJECT as STACK-IP:PARSE-IP reads it, or NIL when ip-protocol refuses it (a
+non-string, \"unknown\", \"1.2.3.4:5678\", \"[::1]\", junk)."
+  (handler-case (stack-ip:parse-ip object)
+    ;; Translate only: what ip-protocol cannot read is not an address (file
+    ;; header, Client address: never trusted, and a hop that stops the walk).
+    (stack-ip:ip-error () nil)))
+
+(defun %trusted-address-p (networks object)
+  "True when OBJECT is an address some network of NETWORKS (STACK-IP:IP-NETWORK
+objects) contains."
+  (let ((address (%ip-address-or-nil object)))
+    (and address
+         (some (lambda (network) (stack-ip:ip-contains-p network address)) networks)
+         t)))
+
+(defun %forwarded-hops (env)
+  "ENV's X-Forwarded-For hops, left to right: the header split at commas, each
+hop trimmed of spaces and tabs, empty hops dropped (file header, Client address,
+step 2)."
+  (let ((header (%env-header env "x-forwarded-for")))
+    (and (stringp header)
+         (loop for hop in (uiop:split-string header :separator ",")
+               for trimmed = (string-trim '(#\Space #\Tab) hop)
+               when (plusp (length trimmed))
+                 collect trimmed))))
+
+(defun %client-address (codec env)
+  "The client address of ENV under CODEC's trusted proxies: a string or NIL.
+File header, Client address (steps 1 to 4)."
+  (let ((networks (%codec-trusted-networks codec))
+        (address (getf env :remote-addr)))               ; 1. the peer
+    (if (and networks (%trusted-address-p networks address))
+        ;; 2 and 3: right to left while the address is a trusted proxy; a hop
+        ;; that is not an address stops the walk.
+        (loop for hop in (reverse (%forwarded-hops env))
+              while (%trusted-address-p networks address)
+              do (if (%ip-address-or-nil hop)
+                     (setf address hop)
+                     (loop-finish))
+              finally (return address))                  ; 4. the string as it appeared
+        ;; No trusted proxies, or a peer that is not one: X-Forwarded-For is
+        ;; not read.
+        address)))
+
 (defmethod rpc-protocol:decode-message-using-codec ((codec htmx-codec) env)
   (let ((http-method (getf env :request-method)))
     (unless (member http-method '(:get :post))
@@ -518,7 +669,9 @@ keyword (%KEY-PAIRS). Nothing is interned. See the file header (Params)."
                          :unmapped-names unmapped
                          :metadata (%request-metadata env)
                          :mode (%request-mode env)
-                         :http-method http-method))))))
+                         :http-method http-method
+                         :client-address (%client-address codec env)
+                         :session (stack-session:env-session env)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Requests (client side)

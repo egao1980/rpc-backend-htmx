@@ -25,7 +25,30 @@ Uploads (0.2.0): a multipart part with a filename reaches the handler as its mim
 
 The scripts are same-origin, so the default CSP holds; a WASM toolkit that compiles its module needs `'wasm-unsafe-eval'` in `script-src` (pass `:csp` a policy string).
 
-Design: [cl-stack/docs/capabilities/canvas.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/canvas.md) § H4h-1b and H4h-2. 0.2.0 implements #5 (uploads) and #6 (page keys, `make-canvas-htmx-transport :page-keys`); 0.3.0 #2, #3 and #4; 0.4.0 canvas-protocol#15 (app assets, page scripts). The exact rules are the file headers in `src/`.
+0.5.0 (slice S1 of [session.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/session.md); #19, #15): visitor sessions and request context. The rules are in `src/session.lisp`, `src/server.lisp` (Sessions), `src/codec.lisp` (Client address) and `src/client.lisp` (Cookie jar); the S1 tests are the spec.
+
+| Feature | API | State |
+|---------|-----|-------|
+| Sessions (#19) | `:sessions` on `make-htmx-transport`, `make-canvas-htmx-transport`, `htmx-app`: `nil` (default, off: 0.4.0 exactly), `t` (an in-memory store per transport), or a session-protocol `session-manager`. Built with session-protocol/middleware's `session-handler` on middleware-protocol, inside the token gate; the CSP header stays outermost and last | implemented |
+| Handler access | `(htmx-session)`, `(htmx-session-value key &optional default)` and its `setf`, `(htmx-session-regenerate)`, `(htmx-session-end)`; a `:call-stream` handler reads the session (committed at the stream's head), a write there is session-protocol's `session-write-error` | implemented |
+| Cross-origin check | with sessions on, an unsafe request from another origin (Sec-Fetch-Site, then Origin against Host, as Go's `CrossOriginProtection`) is a 403 (`htmx-cross-origin`) before any session or body | implemented |
+| Client address (#15) | `htmx-message-client-address`: `:remote-addr`, or with `:trusted-proxies` (addresses and CIDR networks, ip-protocol) the right-most untrusted `X-Forwarded-For` hop; spoofed headers ignored otherwise | implemented |
+| `Last-Event-ID` (#15) | `:last-event-id` in the message metadata, for a reconnecting `:call-stream` | implemented |
+| Test client | `make-htmx-client :cookies t` (a cookie jar: Set-Cookie in, Cookie out, per client), `:remote-addr`; `htmx-client-cookies`, `htmx-client-cookie` | implemented |
+
+```lisp
+(hc:make-canvas-htmx-transport
+ :sessions (stack-session:make-session-manager :idle-ttl 3600)
+ :trusted-proxies '("10.0.0.0/8"))
+
+(defun wizard-step (&key answer)
+  (push answer (h:htmx-session-value "answers"))
+  (canvas:el :p nil (format nil "~D answers" (length (h:htmx-session-value "answers")))))
+```
+
+A session needs a secrets backend (ids) and a json-protocol backend (the stored record), e.g. crypto-backend-ironclad and json-backend-jzon; `htmx-app` checks both when sessions are on.
+
+Design: [cl-stack/docs/capabilities/canvas.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/canvas.md) § H4h-1b and H4h-2. 0.2.0 implements #5 (uploads) and #6 (page keys, `make-canvas-htmx-transport :page-keys`); 0.3.0 #2, #3 and #4; 0.4.0 canvas-protocol#15 (app assets, page scripts); 0.5.0 #19 and #15. The exact rules are the file headers in `src/`.
 
 ```sh
 cl-repo test --system rpc-backend-htmx

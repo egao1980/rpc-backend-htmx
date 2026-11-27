@@ -107,6 +107,18 @@
 ;;; The asset route below is gated and carries the header like any other
 ;;; response: HTMX-APP wraps the :around (server.lisp, HTMX-APP).
 ;;;
+;;; Sessions and request context (0.5.0, rpc-backend-htmx#19 #15).
+;;; MAKE-CANVAS-HTMX-TRANSPORT &key … trusted-proxies sessions: the core
+;;; transport's options, validated the same way and with the same defaults (both
+;;; off): TRUSTED-PROXIES goes to the codec (codec.lisp, Client address),
+;;; SESSIONS NIL, T or a STACK-SESSION:SESSION-MANAGER (server.lisp, Sessions).
+;;; With sessions in force the asset route (a GET under the asset prefix, which
+;;; is outside the method prefix by default) gets no session: no store read, no
+;;; Set-Cookie (session.lisp, step 2). A canvas reads the visitor's session with
+;;; HTMX-SESSION / HTMX-SESSION-VALUE like any handler; PAGE, fragments and
+;;; events are unchanged, and the session's Set-Cookie sits before the CSP
+;;; header, which stays last.
+;;;
 ;;; Uploads (0.2.0, rpc-backend-htmx#5): the core codec hands a multipart file
 ;;; part to the handler as its STACK-MIME:MIME-ENTITY (codec.lisp), the value
 ;;; canvas-protocol (COERCE-PARAM part :file &key max-size accept multiple)
@@ -215,18 +227,23 @@ rules; a malformed value → TYPE-ERROR, an unknown asset → CANVAS-ASSET-NOT-F
                                      (page-title "canvas")
                                      (max-body-bytes rpc-backend-htmx:+default-max-body-bytes+)
                                      (max-params rpc-backend-htmx:+default-max-params+)
+                                     trusted-proxies
                                      (error-target rpc-backend-htmx:+error-fragment-target+)
                                      (error-swap rpc-backend-htmx:+error-fragment-swap+)
                                      page-keys page-scripts
                                      (csp t) token
-                                     (token-name rpc-backend-htmx:+default-token-name+))
-  "A CANVAS-HTMX-TRANSPORT. See the file header (Page keys, Page scripts, Security)."
+                                     (token-name rpc-backend-htmx:+default-token-name+)
+                                     sessions)
+  "A CANVAS-HTMX-TRANSPORT. See the file header (Page keys, Page scripts, Security,
+Sessions and request context)."
   (check-type asset-prefix (and string (satisfies rpc-backend-htmx::%slash-bounded-p)))
   (check-type page-title string)
   (make-instance 'canvas-htmx-transport
                  :codec (rpc-backend-htmx:make-htmx-codec :prefix prefix
                                                           :max-body-bytes max-body-bytes
-                                                          :max-params max-params)
+                                                          :max-params max-params
+                                                          :trusted-proxies trusted-proxies)
+                 :sessions (rpc-backend-htmx::%sessions-option sessions)
                  :asset-prefix asset-prefix
                  :page-title page-title
                  :page-keys (and page-keys (%page-keys-option page-keys))
