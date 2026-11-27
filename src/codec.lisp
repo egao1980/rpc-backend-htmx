@@ -593,14 +593,54 @@ keyword (%KEY-PAIRS). Nothing is interned. See the file header (Params)."
 
 ;;; Client address (0.5.0, #15): file header, Client address.
 
+;;; Its own NOTINLINE function, its value used through a plain call: the
+;;; HANDLER-CASE never sits inside an OR or a LET test (the ECL 26.5.5 shapes,
+;;; server.lisp).
+(declaim (notinline %ip-address-or-nil))
+(defun %ip-address-or-nil (object)
+  "OBJECT as STACK-IP:PARSE-IP reads it, or NIL when ip-protocol refuses it (a
+non-string, \"unknown\", \"1.2.3.4:5678\", \"[::1]\", junk)."
+  (handler-case (stack-ip:parse-ip object)
+    ;; Translate only: what ip-protocol cannot read is not an address (file
+    ;; header, Client address: never trusted, and a hop that stops the walk).
+    (stack-ip:ip-error () nil)))
+
+(defun %trusted-address-p (networks object)
+  "True when OBJECT is an address some network of NETWORKS (STACK-IP:IP-NETWORK
+objects) contains."
+  (let ((address (%ip-address-or-nil object)))
+    (and address
+         (some (lambda (network) (stack-ip:ip-contains-p network address)) networks)
+         t)))
+
+(defun %forwarded-hops (env)
+  "ENV's X-Forwarded-For hops, left to right: the header split at commas, each
+hop trimmed of spaces and tabs, empty hops dropped (file header, Client address,
+step 2)."
+  (let ((header (%env-header env "x-forwarded-for")))
+    (and (stringp header)
+         (loop for hop in (uiop:split-string header :separator ",")
+               for trimmed = (string-trim '(#\Space #\Tab) hop)
+               when (plusp (length trimmed))
+                 collect trimmed))))
+
 (defun %client-address (codec env)
   "The client address of ENV under CODEC's trusted proxies: a string or NIL.
 File header, Client address (steps 1 to 4)."
-  ;; S1 contract stub. It runs on every request, so it does not signal: it
-  ;; answers NIL, which the 0.4.0 suite never reads. The implementation
-  ;; follows the file header.
-  (declare (ignore codec env))
-  nil)
+  (let ((networks (%codec-trusted-networks codec))
+        (address (getf env :remote-addr)))               ; 1. the peer
+    (if (and networks (%trusted-address-p networks address))
+        ;; 2 and 3: right to left while the address is a trusted proxy; a hop
+        ;; that is not an address stops the walk.
+        (loop for hop in (reverse (%forwarded-hops env))
+              while (%trusted-address-p networks address)
+              do (if (%ip-address-or-nil hop)
+                     (setf address hop)
+                     (loop-finish))
+              finally (return address))                  ; 4. the string as it appeared
+        ;; No trusted proxies, or a peer that is not one: X-Forwarded-For is
+        ;; not read.
+        address)))
 
 (defmethod rpc-protocol:decode-message-using-codec ((codec htmx-codec) env)
   (let ((http-method (getf env :request-method)))

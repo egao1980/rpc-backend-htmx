@@ -125,34 +125,96 @@ jar; REMOTE-ADDR a string sets every env's :REMOTE-ADDR (file header)."
                  :jar (and cookies (cl-cookie:make-cookie-jar))
                  :remote-addr remote-addr))
 
+;;; Expiry. cl-cookie 0.2.0 exports no expiry test (EXPIRED-COOKIE-P is
+;;; internal), so a received cookie keeps its expiry the way RFC 6265 stores
+;;; it: a Max-Age becomes the absolute expiry-time now + Max-Age (§5.2.2, and
+;;; Max-Age wins over Expires, §5.3 step 3) in cl-cookie's own Expires field.
+;;; Sends then expire through cl-cookie (COOKIE-JAR-HOST-COOKIES prunes by
+;;; Expires), and the listing applies the same test to the same field.
+
 (defun htmx-client-cookies (client)
   "NIL without a jar, else a fresh alist of the cookies CLIENT's jar holds (file
 header, Cookie jar)."
-  (if (%client-jar client)
-      (%s1-pending "HTMX-CLIENT-COOKIES (the cookie jar)")
-      nil))
+  (let ((jar (%client-jar client)))
+    (and jar
+         (let ((now (get-universal-time)))
+           (loop for cookie in (cl-cookie:cookie-jar-cookies jar)
+                 for expires = (cl-cookie:cookie-expires cookie)
+                 unless (and expires (< expires now))      ; expired: left out
+                   collect (cons (cl-cookie:cookie-name cookie)
+                                 (cl-cookie:cookie-value cookie)))))))
 
 (defun htmx-client-cookie (client name)
   "The value of CLIENT's jar cookie NAME, or NIL (file header, Cookie jar)."
-  (if (%client-jar client)
-      (%s1-pending "HTMX-CLIENT-COOKIE (the cookie jar)")
-      (progn (check-type name string) nil)))
+  (check-type name string)
+  (values (cdr (assoc name (htmx-client-cookies client) :test #'string=))))
+
+(defun %jar-host (env)
+  "The host the jar matches ENV's cookies against: its :SERVER-NAME, or \"localhost\"."
+  (or (getf env :server-name) "localhost"))
+
+(defun %https-env-p (env)
+  "True when ENV's :URL-SCHEME is \"https\" (STRING-EQUAL)."
+  (let ((scheme (getf env :url-scheme)))
+    (and scheme (typep scheme '(or string symbol)) (string-equal scheme "https") t)))
+
+(defun %fresh-headers (table)
+  "A new header table holding the entries of TABLE (a hash table, or NIL for
+none), with TABLE's test."
+  (let ((copy (make-hash-table :test (if (hash-table-p table) (hash-table-test table) 'equal))))
+    (when (hash-table-p table)
+      (maphash (lambda (name value) (setf (gethash name copy) value)) table))
+    copy))
 
 (defun %client-env (client env)
   "ENV as CLIENT sends it: the jar's Cookie and the client's :REMOTE-ADDR in
 front (file header, Cookie jar, step 1); ENV itself without a jar and an address."
-  ;; S1 contract stub: a 0.4.0 client (no jar, no address) is unchanged.
-  (if (or (%client-jar client) (htmx-client-remote-addr client))
-      (%s1-pending "the cookie jar and :REMOTE-ADDR of HTMX-CLIENT")
-      env))
+  (let ((jar (%client-jar client))
+        (address (htmx-client-remote-addr client)))
+    (if (not (or jar address))
+        env                                               ; a 0.4.0 client
+        (let ((headers (%fresh-headers (getf env :headers))))
+          ;; An explicit Cookie header wins over the jar's for this request.
+          (when (and jar (null (gethash "cookie" headers)))
+            (let ((cookies (cl-cookie:cookie-jar-host-cookies jar (%jar-host env)
+                                                              (getf env :path-info)
+                                                              :securep (%https-env-p env))))
+              (when cookies
+                (setf (gethash "cookie" headers) (cl-cookie:write-cookie-header cookies)))))
+          ;; A new plist in front of ENV, which is shared as its tail and never
+          ;; modified (nor is its :HEADERS table).
+          (if address
+              (list* :headers headers :remote-addr address env)
+              (list* :headers headers env))))))
+
+(defun %receive-cookie (jar cookie)
+  "Put COOKIE, as CL-COOKIE:PARSE-SET-COOKIE-HEADER read it, into JAR (file
+header, Cookie jar, step 3). NIL (cl-cookie refused the header with a warning)
+changes nothing."
+  (when cookie
+    (let ((max-age (cl-cookie:cookie-max-age cookie)))
+      (cond ((and max-age (<= max-age 0))
+             ;; Removed at once: cl-cookie's own test would keep it up to a second.
+             (setf (cl-cookie:cookie-jar-cookies jar)
+                   (remove cookie (cl-cookie:cookie-jar-cookies jar) :test #'cl-cookie:cookie=)))
+            (t
+             (when max-age                ; the expiry-time, in the Expires field (above)
+               (setf (cl-cookie:cookie-expires cookie) (+ (get-universal-time) max-age)
+                     (cl-cookie:cookie-max-age cookie) nil))
+             ;; The same name, host or domain, and path replaces the one held,
+             ;; and the jar keeps the order cookies were last set in.
+             (cl-cookie:merge-cookies jar (list cookie)))))))
 
 (defun %keep-cookies (client env headers)
   "Merge the Set-Cookie entries of the reply HEADERS (a Clack plist) into
 CLIENT's jar, ENV the request's (file header, Cookie jar, step 3)."
-  (declare (ignore env headers))
-  ;; S1 contract stub: nothing to keep without a jar.
-  (when (%client-jar client)
-    (%s1-pending "the cookie jar of HTMX-CLIENT")))
+  (let ((jar (%client-jar client)))
+    (when jar
+      (let ((host (%jar-host env))
+            (path (getf env :path-info)))
+        (loop for (name value) on headers by #'cddr
+              when (string-equal name "set-cookie")          ; a keyword or a string
+                do (%receive-cookie jar (cl-cookie:parse-set-cookie-header value host path)))))))
 
 (defclass htmx-reply ()
   ((status :initarg :status :reader htmx-reply-status)

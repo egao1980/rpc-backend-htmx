@@ -19,11 +19,6 @@
 ;;; sessions in force, an unsafe request that a browser sent from another
 ;;; origin (session.lisp, Cross-origin requests). Slots and report are final
 ;;; (given in the S1 contract).
-;;;
-;;; %S1-PENDING (not exported, deliberately not an HTMX-ERROR) is the S1
-;;; contract's stub signal: every function S1 leaves to the implementation
-;;; signals it, or returns an inert value where the 0.4.0 request path runs
-;;; through it (each stub says which). The implementation removes it.
 
 (define-condition htmx-error (rpc-protocol:rpc-error)
   ((status :initarg :status :initform 500 :reader htmx-error-status
@@ -58,17 +53,6 @@ wrong or already used bootstrap token. server.lisp, Token gate."))
 a browser sent from another origin (0.5.0, #19): 403 before any session is begun
 or any body read. session.lisp, Cross-origin requests. Its report is
 \"htmx error 403: Cross-origin request\"; it never echoes a header value."))
-
-(define-condition %s1-pending (error)
-  ((what :initarg :what :reader %s1-pending-what))
-  (:report (lambda (c s)
-             (format s "rpc-backend-htmx 0.5.0 (S1) not implemented yet: ~A"
-                     (%s1-pending-what c))))
-  (:documentation "S1 contract stub (see the file header). Not an HTMX-ERROR."))
-
-(defun %s1-pending (what)
-  "Signal %S1-PENDING for WHAT (S1 contract stub)."
-  (error '%s1-pending :what what))
 
 (define-condition htmx-method-not-allowed (htmx-error) ()
   (:default-initargs :status 405 :code rpc-protocol:+invalid-request+
