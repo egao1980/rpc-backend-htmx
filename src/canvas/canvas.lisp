@@ -29,9 +29,10 @@
 ;;;   HTMX-RESULT-NODES — the result through CANVAS:RENDER (components, charts,
 ;;;     strings, numbers, nodes, lists), flattened to a fresh list of nodes.
 ;;;   HTMX-FULL-PAGE — (CANVAS:PAGE nodes :title (canvas-transport-page-title tx)
-;;;     :keys K), the html-document, so a plain browser GET gets a whole page with
+;;;     :keys K :scripts S), the html-document, so a plain browser GET gets a whole page with
 ;;;     htmx loaded from the asset route; HX requests still get the fragment.
-;;;     K is NIL unless PAGE-KEYS (below) selects the page.
+;;;     K is NIL unless PAGE-KEYS (below) selects the page; S is NIL unless
+;;;     PAGE-SCRIPTS (below) does.
 ;;;   HTMX-CONDITION-STATUS — CANVAS:CANVAS-COERCION-ERROR → 422 (its subclass
 ;;;     CANVAS:CANVAS-UPLOAD-TOO-LARGE included); others as the core.
 ;;;
@@ -57,6 +58,36 @@
 ;;;   after the htmx and htmx-ext-sse scripts. Fragments (HX requests, POSTs),
 ;;;   streams and error responses never carry a script, whatever PAGE-KEYS is.
 ;;;   The asset route already serves canvas-keys.js (CANVAS:ASSET-NAMES).
+;;;
+;;; Page scripts (0.4.0, canvas-protocol#15). canvas-protocol 0.3.0 registers
+;;; an app's own assets (CANVAS:REGISTER-ASSET / DEFINE-ASSET: first-party
+;;; scripts, a vendored JS/WASM toolkit) and loads them with
+;;; (CANVAS:PAGE … :scripts entries).
+;;; The asset route serves every name in CANVAS:ASSET-NAMES, app assets
+;;;   included, unchanged: 200, :content-type (ASSET-CONTENT-TYPE name) (.wasm
+;;;   application/wasm), body the held (CANVAS:ASSET-OCTETS name) vector, so a
+;;;   multi-MB file is not copied per request. Names may contain "/".
+;;; MAKE-CANVAS-HTMX-TRANSPORT &key page-scripts:
+;;;   NIL (default) — no app script; every response as in 0.3.0.
+;;;   a non-empty proper list of rules (SELECTION . SCRIPTS):
+;;;     SELECTION — T (every full page) or a non-empty proper list of handler
+;;;       names, as for PAGE-KEYS (method symbols or "PKG::NAME" strings);
+;;;     SCRIPTS — a non-empty proper list of CANVAS:PAGE :scripts entries: an
+;;;       asset name string, or (name &key module defer) with a string name.
+;;;   Anything else → TYPE-ERROR at construction (CHECK-TYPE). Each named
+;;;   asset must exist at construction (register assets at load time, make the
+;;;   transport after) → CANVAS:CANVAS-ASSET-NOT-FOUND otherwise.
+;;; CANVAS-TRANSPORT-PAGE-SCRIPTS → NIL or a fresh list of (SELECTION .
+;;;   SCRIPTS), SELECTION T or method-name strings, in the given order.
+;;; HTMX-FULL-PAGE passes :scripts — the SCRIPTS of every rule whose SELECTION
+;;;   is T or lists the message's HTMX-MESSAGE-METHOD, in rule order, a name
+;;;   already taken by an earlier rule skipped — so the page ends <head> with
+;;;   them, after the htmx, htmx-ext-sse and (PAGE-KEYS) canvas-keys scripts.
+;;;   No rule matching → :scripts NIL, the page byte-identical to 0.3.0.
+;;;   Fragments, streams and error responses never carry a script.
+;;; CSP: the scripts are 'self', so the default policy holds. A WASM toolkit
+;;;   compiling its module needs 'wasm-unsafe-eval': pass :csp a policy string,
+;;;   e.g. +DEFAULT-CSP+ with script-src 'self' 'wasm-unsafe-eval'.
 ;;;
 ;;; Security (0.3.0, rpc-backend-htmx#4). MAKE-CANVAS-HTMX-TRANSPORT &key …
 ;;; max-params (csp t) token (token-name +default-token-name+): the core
@@ -87,7 +118,9 @@
                  :reader canvas-transport-asset-prefix)
    (page-title :initarg :page-title :initform "canvas" :reader canvas-transport-page-title)
    (page-keys :initarg :page-keys :initform nil :reader canvas-transport-page-keys
-              :documentation "NIL, T or a list of method-name strings (see the file header)."))
+              :documentation "NIL, T or a list of method-name strings (see the file header).")
+   (page-scripts :initarg :page-scripts :initform nil :reader %page-script-rules
+                 :documentation "NIL or a list of (T-or-method-names . script-entries)."))
   (:documentation "htmx transport serving canvas functions, pages and canvas assets."))
 
 (defun %page-key-name-p (object)
@@ -126,16 +159,68 @@ PAGE-KEYS is T or lists the message's method). See the file header."
              (member (rpc-backend-htmx:htmx-message-method message) keys :test #'string=)
              t))))
 
+(defun %page-script-entry-p (object)
+  "True for one CANVAS:PAGE :scripts entry: a name, or (name &key module defer)."
+  (or (stringp object)
+      (and (consp object)
+           (stringp (car object))
+           (let ((options (cdr object)))
+             (and (null (cdr (last options)))
+                  (evenp (length options))
+                  (loop for (key) on options by #'cddr
+                        always (member key '(:module :defer))))))))
+
+(defun %proper-list-of-p (object predicate)
+  (and (consp object) (null (cdr (last object))) (every predicate object)))
+
+(defun %page-script-rule-p (object)
+  "True for one PAGE-SCRIPTS rule (SELECTION . SCRIPTS). See the file header."
+  (and (consp object)
+       (or (eq (car object) t) (%page-key-list-p (car object)))
+       (%proper-list-of-p (cdr object) #'%page-script-entry-p)))
+
+(defun %page-script-rules-p (object)
+  (%proper-list-of-p object #'%page-script-rule-p))
+
+(defun %page-scripts-option (page-scripts)
+  "MAKE-CANVAS-HTMX-TRANSPORT's PAGE-SCRIPTS → NIL or a fresh normalized list of
+rules; a malformed value → TYPE-ERROR, an unknown asset → CANVAS-ASSET-NOT-FOUND."
+  (check-type page-scripts (or null (satisfies %page-script-rules-p))
+              "NIL or a non-empty list of (T-or-handler-names . script-entries)")
+  (loop for (selection . scripts) in page-scripts
+        do (dolist (entry scripts)
+             ;; Signals CANVAS-ASSET-NOT-FOUND now rather than on the first page.
+             (canvas:asset-content-type (if (consp entry) (car entry) entry)))
+        collect (cons (if (eq selection t) t (%page-keys-option selection))
+                      (copy-tree scripts))))
+
+(defun canvas-transport-page-scripts (transport)
+  "NIL or a fresh list of (SELECTION . SCRIPTS). See the file header."
+  (copy-tree (%page-script-rules transport)))
+
+(defun %page-scripts (transport message)
+  "The :scripts entries for MESSAGE's full page. See the file header."
+  (let ((method (rpc-backend-htmx:htmx-message-method message))
+        (scripts '()))
+    (loop for (selection . entries) in (%page-script-rules transport)
+          when (or (eq selection t) (member method selection :test #'string=))
+            do (dolist (entry entries)
+                 (let ((name (if (consp entry) (car entry) entry)))
+                   (unless (member name scripts :test #'string=
+                                                :key (lambda (e) (if (consp e) (car e) e)))
+                     (push entry scripts)))))
+    (nreverse scripts)))
+
 (defun make-canvas-htmx-transport (&key (prefix "/canvas/") (asset-prefix "/canvas-assets/")
                                      (page-title "canvas")
                                      (max-body-bytes rpc-backend-htmx:+default-max-body-bytes+)
                                      (max-params rpc-backend-htmx:+default-max-params+)
                                      (error-target rpc-backend-htmx:+error-fragment-target+)
                                      (error-swap rpc-backend-htmx:+error-fragment-swap+)
-                                     page-keys
+                                     page-keys page-scripts
                                      (csp t) token
                                      (token-name rpc-backend-htmx:+default-token-name+))
-  "A CANVAS-HTMX-TRANSPORT. See the file header (Page keys, Security)."
+  "A CANVAS-HTMX-TRANSPORT. See the file header (Page keys, Page scripts, Security)."
   (check-type asset-prefix (and string (satisfies rpc-backend-htmx::%slash-bounded-p)))
   (check-type page-title string)
   (make-instance 'canvas-htmx-transport
@@ -145,6 +230,7 @@ PAGE-KEYS is T or lists the message's method). See the file header."
                  :asset-prefix asset-prefix
                  :page-title page-title
                  :page-keys (and page-keys (%page-keys-option page-keys))
+                 :page-scripts (%page-scripts-option page-scripts)
                  :error-target error-target
                  :error-swap error-swap
                  :csp (rpc-backend-htmx::%transport-csp csp)
@@ -191,7 +277,7 @@ else the canvas-protocol default) limited to HANDLERS."
   (if (%known-asset-p name)
       (list 200
             (list :content-type (canvas:asset-content-type name))
-            (canvas:asset-bytes name))
+            (canvas:asset-octets name))
       (rpc-backend-htmx:htmx-error-response
        transport
        (make-condition 'rpc-backend-htmx:htmx-error :status 404 :message "Asset not found"))))
@@ -228,7 +314,9 @@ else the canvas-protocol default) limited to HANDLERS."
   (canvas:page nodes :title (canvas-transport-page-title transport)
                      :keys (and (canvas-transport-page-keys transport)
                                 (%page-keys-p transport message)
-                                t)))
+                                t)
+                     :scripts (and (%page-script-rules transport)
+                                   (%page-scripts transport message))))
 
 (defmethod rpc-backend-htmx:htmx-condition-status ((transport canvas-htmx-transport) condition)
   (if (typep condition 'canvas:canvas-coercion-error)
