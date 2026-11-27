@@ -15,7 +15,17 @@ Uploads (0.2.0): a multipart part with a filename reaches the handler as its mim
 - Zero-arg canvases (#3): `(defun dashboard () …)` is called with no arguments; params sent to it are a 400. A lambda list the server cannot call (a required or `&optional` parameter) is an `htmx-error` when the table is built.
 - CSP and token gate (#4): `:csp` on `make-htmx-transport`, `make-canvas-htmx-transport` and `htmx-app` adds `Content-Security-Policy` to every response, streams and assets included (the canvas transport sends the brief's policy by default; the core is opt-in). `:token` gates the app: `htmx-token-url` gives a one-time URL whose single-use bootstrap token is exchanged for a separate, freshly generated session secret (secrets-protocol CSPRNG) in an HttpOnly, SameSite=Strict cookie; a used token, or any request without that cookie, is a 403. A secrets backend must be loaded (e.g. crypto-backend-ironclad).
 
-Design: [cl-stack/docs/capabilities/canvas.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/canvas.md) § H4h-1b and H4h-2. 0.2.0 implements #5 (uploads) and #6 (page keys, `make-canvas-htmx-transport :page-keys`); 0.3.0 #2, #3 and #4. The exact rules are the file headers in `src/`.
+0.4.0 (canvas-protocol#15, requires canvas-protocol 0.3.0): the asset route serves an app's own assets registered with `canvas:define-asset` / `canvas:register-asset` (names with `/`, e.g. `vendor/kit/kit.wasm`), with their content type (`application/wasm` for `.wasm`) and exact bytes, without a copy per request. `make-canvas-htmx-transport :page-scripts` picks the scripts per full page: rules `(selection . scripts)`, the selection `t` (every page) or a list of handler names as for `:page-keys`, the scripts `canvas:page :scripts` entries (`"app/main.js"`, `("vendor/kit/kit.mjs" :module t)`):
+
+```lisp
+(hc:make-canvas-htmx-transport
+ :page-scripts '((t "app/main.js")
+                 ((editor) ("vendor/kit/kit.mjs" :module t) "app/editor.js")))
+```
+
+The scripts are same-origin, so the default CSP holds; a WASM toolkit that compiles its module needs `'wasm-unsafe-eval'` in `script-src` (pass `:csp` a policy string).
+
+Design: [cl-stack/docs/capabilities/canvas.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/canvas.md) § H4h-1b and H4h-2. 0.2.0 implements #5 (uploads) and #6 (page keys, `make-canvas-htmx-transport :page-keys`); 0.3.0 #2, #3 and #4; 0.4.0 canvas-protocol#15 (app assets, page scripts). The exact rules are the file headers in `src/`.
 
 ```sh
 cl-repo test --system rpc-backend-htmx

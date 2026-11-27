@@ -1,5 +1,5 @@
 (defsystem "rpc-backend-htmx"
-  :version "0.3.0"
+  :version "0.4.0"
   :description "htmx as an rpc-protocol transport + codec: Clack server, SSE streams, multipart uploads, CSP and token gate, test client (H4h-1b)"
   :author "egao1980"
   :license "MIT"
@@ -25,12 +25,12 @@
   :in-order-to ((test-op (test-op "rpc-backend-htmx/tests"))))
 
 (defsystem "rpc-backend-htmx/canvas"
-  :version "0.3.0"
+  :version "0.4.0"
   :description "canvas-protocol resolver + page/asset routes for rpc-backend-htmx (H4h-1b)"
   :author "egao1980"
   :license "MIT"
   :depends-on ("rpc-backend-htmx"
-               (:version "canvas-protocol" "0.2.0"))
+               (:version "canvas-protocol" "0.3.0"))
   :pathname "src/canvas"
   :serial t
   :components ((:file "package")
@@ -39,7 +39,7 @@
 (defsystem "rpc-backend-htmx/tests"
   :depends-on ("rpc-backend-htmx"
                "rpc-backend-htmx/canvas"
-               (:version "canvas-protocol" "0.2.2")
+               (:version "canvas-protocol" "0.3.0")
                (:version "rpc-protocol-json" "0.1.1")
                (:version "json-protocol" "0.2.3")
                (:version "json-backend-jzon" "0.2.3")
@@ -67,7 +67,8 @@
                (:file "keys-test")
                (:file "arity-test")
                (:file "csp-test")
-               (:file "token-test"))
+               (:file "token-test")
+               (:file "page-scripts-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
