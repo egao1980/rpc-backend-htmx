@@ -133,20 +133,28 @@ the boundary (CR LF --XyZ CR LF) and \"--\" inside, and it ends in CR LF.")
     (ok (equalp +binary+ (part-octets (getf seen :doc))))))
 
 (deftest multipart-filename-is-mime-protocols
-  ;; FILENAME is the client's, as mime-protocol reads it: filename* (RFC 8187)
-  ;; preferred, nothing reduced or cleaned here (canvas-protocol does that).
-  ;; A browser's raw UTF-8 filename and a backslash in it: the next test.
+  ;; FILENAME is the client's, as mime-protocol reads it, nothing reduced or
+  ;; cleaned here (canvas-protocol does that). A browser's raw UTF-8 filename
+  ;; and a backslash in it: the next test.
+  ;; mime-protocol 0.3.6 (mime-protocol#21): RFC 7578 4.2 has no filename* in
+  ;; form-data. One that reads as its filename is fine; one that differs, or
+  ;; a filename* alone, is refused (servers disagree on which one wins).
   (let ((params (mp-params
-                 (list (mp-part '("Content-Disposition: form-data; name=\"a\"; filename=\"Prelude.svg\"; filename*=UTF-8''Pr%C3%A9lude.svg"
+                 (list (mp-part '("Content-Disposition: form-data; name=\"a\"; filename=\"Prelude.svg\"; filename*=UTF-8''Prelude.svg"
                                   "Content-Type: image/svg+xml")
                                 +svg+)
                        (mp-file "b" "scores/b.svg" +svg+ "image/svg+xml")))))
-    (ok (equal "Prélude.svg" (part-filename (getf params :a))))
+    (ok (equal "Prelude.svg" (part-filename (getf params :a))))
     (ok (equal "scores/b.svg" (part-filename (getf params :b)))))
+  (ok (signals (decode (mp-env (list (mp-part '("Content-Disposition: form-data; name=\"a\"; filename=\"Prelude.svg\"; filename*=UTF-8''Pr%C3%A9lude.svg"
+                                                "Content-Type: image/svg+xml")
+                                              +svg+))))
+        'h:htmx-bad-request)
+      "a filename* that differs from filename → 400")
   (ok (signals (decode (mp-env (list (mp-part '("Content-Disposition: form-data; name=\"a\"; filename*=KOI8-R''%C1"
                                                 "Content-Type: image/svg+xml")
                                               +svg+))))
-               'h:htmx-bad-request)
+        'h:htmx-bad-request)
       "a filename* mime-protocol cannot read → 400, not a 500"))
 
 (defparameter +utf8-filename+ "Ünïcödé — 楽譜.svg"
@@ -364,11 +372,11 @@ the boundary (CR LF --XyZ CR LF) and \"--\" inside, and it ends in CR LF.")
                   body)
           ":filename \"\" sends an empty file input"))
     (multiple-value-bind (body b) (wire (list :score (svg-file "Prélude.svg")))
-      (ok (equalp (bytes (wire-file b "form-data; name=\"score\"; filename=\"Prélude.svg\"; filename*=UTF-8''Pr%C3%A9lude.svg"
+      (ok (equalp (bytes (wire-file b "form-data; name=\"score\"; filename=\"Prélude.svg\""
                                     "image/svg+xml" (octets +svg+))
                          (wire-end b))
                   body)
-          "a non-ASCII filename: UTF-8 in filename, RFC 8187 filename* too (mime-protocol)"))
+          "a non-ASCII filename: UTF-8 in filename, no filename* (mime-protocol 0.3.6, RFC 7578 4.2)"))
     (multiple-value-bind (body b) (wire (list :x (list :filename (format nil "a\"b~C~Cc.svg" #\Return #\Linefeed)
                                                        :content "x")))
       (ok (equalp (bytes (wire-file b "form-data; name=\"x\"; filename=\"a%22b%0D%0Ac.svg\""
